@@ -1,18 +1,20 @@
 #include <SoftwareSerial.h>
+#include <EEPROM.h>
+#include <avr/wdt.h> // Сторожевой таймер (защита от зависаний)
 
 // =================================================================================
 // РАСПИНОВКА (PINS) - БЛОК ПРЕССА
 // =================================================================================
-#define PIN_DENSITY        2    // Вход: Плотность (через оптрон)
-#define PIN_S_START        3    // Вход: Начало обвязки (через оптрон)
-#define PIN_S_END          4    // Вход: Конец обвязки (через оптрон)
-#define PIN_DOOR           5    // Вход: Дверь открыта (через оптрон)
-#define PIN_RELAY_TWINE    6    // Выход: Реле ШПАГАТА
-#define PIN_RELAY_SOUND    7    // Выход: Реле гудка 
-#define PIN_RESET          8    // Вход: Локальная кнопка Сброс
-#define PIN_RELAY_LIGHT    9    // Выход: Реле маячка 
-#define PIN_RELAY_NET      10   // Выход: Реле СЕТКИ
-#define PIN_SWITCH_NET     11   // Вход: Тумблер Сетка/Шпагат на блоке
+#define PIN_DENSITY        2    
+#define PIN_S_START        3    
+#define PIN_S_END          4    
+#define PIN_DOOR           5    
+#define PIN_RELAY_TWINE    6    
+#define PIN_RELAY_SOUND    7    
+#define PIN_RESET          8    
+#define PIN_RELAY_LIGHT    9    
+#define PIN_RELAY_NET      10   
+#define PIN_SWITCH_NET     11   
 
 #define PIN_RS485_RX       A0   
 #define PIN_RS485_TX       A1   
@@ -20,38 +22,59 @@
 
 SoftwareSerial rs485(PIN_RS485_RX, PIN_RS485_TX);
 
+// =================================================================================
+// EEPROM АДРЕСА И ПЕРЕМЕННЫЕ (ПАМЯТЬ ТЕПЕРЬ ЗДЕСЬ!)
+// =================================================================================
+#define EEPROM_MAGIC_BYTE 0x42 
+#define ADDR_MAGIC        0
+#define ADDR_TOTAL_BALES  1    // 4 байта (uint32_t)
+#define ADDR_T_DENS       5    // 1 байт
+#define ADDR_T_STOP       6    // 1 байт
+#define ADDR_T_NET        7    // 1 байт
+#define ADDR_T_TWINE      8    // 1 байт
+
+uint32_t totalBales = 0;
+uint8_t t_Dens = 1;   // Секунды по умолчанию
+uint8_t t_Stop = 4;
+uint8_t t_Net = 2;
+uint8_t t_Twine = 3;
+
+// Жесткие настройки железа
 struct Config {
-  const uint32_t plotnostLozh = 1000;       
-  const uint32_t timeForStopTraktor = 4000; 
   const uint32_t timeoutMotorMax = 10000;   
-  const uint32_t timerTwineRun = 3000;      
-  const uint32_t timerNetRun = 2000;        
   const uint32_t timeoutEndSensor = 15000;  
   const uint32_t timeoutReturnHome = 10000; 
   const uint32_t debounce = 50;             
-
   const bool motorActiveHigh = true;  
   const bool soundActiveHigh = false; 
   const bool lightActiveHigh = true;  
 };
 Config cfg;
 
-// --- ОБНОВЛЕННАЯ СТРУКТУРА ДАННЫХ ОТ ПУЛЬТА ---
+// --- СТРУКТУРЫ ДАННЫХ ДЛЯ ОБЩЕНИЯ ---
 struct MasterData { 
   bool doReset; 
-  bool isManualMode; // true = Ручной, false = Авто
-  bool isNetMode;    // true = Сетка, false = Шпагат
+  bool isManualMode; 
+  bool isNetMode; 
+  bool saveSettings; // Флаг: если true, пульт приказал сохранить новые настройки!
+  uint8_t timeoutDens;
+  uint8_t timeoutStop;
+  uint8_t timeoutNet;
+  uint8_t timeoutTwine;
 };
 MasterData rxData;
 
 struct SlaveData {
   uint8_t currentState;  
-  uint16_t totalBales;   
   uint16_t sessionBales; 
+  uint32_t totalBales;   // Отправляем Тотал пульту
+  uint8_t t_Dens;        // Отправляем текущие настройки пульту
+  uint8_t t_Stop;
+  uint8_t t_Net;
+  uint8_t t_Twine;
 };
-SlaveData txData = {0, 0, 0}; 
+SlaveData txData; 
 
-// Глобальные переменные для сторожевого таймера (Watchdog)
 unsigned long lastMasterPacketTime = 0;
 bool isRemoteConnected = false;
 
@@ -128,14 +151,11 @@ unsigned long testModeStartTime = 0;
 bool doorWasOpened = false;          
 uint8_t resetClicks = 0;             
 unsigned long lastResetClickTime = 0;
+uint16_t sessionBales = 0;
 
-// --- УМНЫЙ ВЫБОР МАТЕРИАЛА ---
 bool getNetMode() { 
-  if (isRemoteConnected) {
-    return rxData.isNetMode; // Приоритет пульта
-  } else {
-    return !digitalRead(PIN_SWITCH_NET); // Локальный тумблер
-  }
+  if (isRemoteConnected) return rxData.isNetMode; 
+  else return !digitalRead(PIN_SWITCH_NET); 
 }
 
 void motorOn() { 
@@ -156,7 +176,15 @@ void executeEmergencyReset() {
 
 void sendRS485Reply() {
   digitalWrite(PIN_RS485_EN, HIGH); delay(2);
+  // Собираем свежие данные для пульта
   txData.currentState = currentState; 
+  txData.sessionBales = sessionBales;
+  txData.totalBales = totalBales;
+  txData.t_Dens = t_Dens;
+  txData.t_Stop = t_Stop;
+  txData.t_Net = t_Net;
+  txData.t_Twine = t_Twine;
+
   rs485.write(0xAA); 
   uint8_t crc = 0; uint8_t* ptr = (uint8_t*)&txData;
   for (uint16_t i = 0; i < sizeof(SlaveData); i++) { rs485.write(ptr[i]); crc ^= ptr[i]; }
@@ -167,14 +195,31 @@ void sendRS485Reply() {
 void listenRS485() {
   if (rs485.available() > 0) { 
     if (rs485.read() == 0xBB) { 
-      delay(5); 
+      // УБРАЛИ ЖЕСТКИЙ DELAY(5). ТЕПЕРЬ УМНОЕ ОЖИДАНИЕ!
+      unsigned long pStart = millis();
+      while (rs485.available() < sizeof(MasterData) + 1) {
+        if (millis() - pStart > 30) break; // Даем пакету до 30 мс, чтобы прилететь целиком
+      }
+
       if (rs485.available() >= sizeof(MasterData) + 1) { 
         uint8_t crc = 0; uint8_t* ptr = (uint8_t*)&rxData;
         for (uint16_t i = 0; i < sizeof(MasterData); i++) { ptr[i] = rs485.read(); crc ^= ptr[i]; }
         if (crc == rs485.read()) {
-          // Успешный прием! Обновляем таймер сторожа.
           lastMasterPacketTime = millis();
           isRemoteConnected = true;
+
+          // Если пульт приказал сохранить настройки
+          if (rxData.saveSettings) {
+            t_Dens = rxData.timeoutDens;
+            t_Stop = rxData.timeoutStop;
+            t_Net = rxData.timeoutNet;
+            t_Twine = rxData.timeoutTwine;
+            // Сохраняем в память
+            EEPROM.put(ADDR_T_DENS, t_Dens);
+            EEPROM.put(ADDR_T_STOP, t_Stop);
+            EEPROM.put(ADDR_T_NET, t_Net);
+            EEPROM.put(ADDR_T_TWINE, t_Twine);
+          }
 
           if (rxData.doReset) executeEmergencyReset(); 
           sendRS485Reply();
@@ -185,21 +230,41 @@ void listenRS485() {
 }
 
 void setup() {
+  // Читаем EEPROM при загрузке
+  uint8_t magic = EEPROM.read(ADDR_MAGIC);
+  if (magic == EEPROM_MAGIC_BYTE) {
+    EEPROM.get(ADDR_TOTAL_BALES, totalBales);
+    EEPROM.get(ADDR_T_DENS, t_Dens);
+    EEPROM.get(ADDR_T_STOP, t_Stop);
+    EEPROM.get(ADDR_T_NET, t_Net);
+    EEPROM.get(ADDR_T_TWINE, t_Twine);
+  } else {
+    // Первый запуск платы пресса
+    EEPROM.put(ADDR_TOTAL_BALES, totalBales);
+    EEPROM.put(ADDR_T_DENS, t_Dens);
+    EEPROM.put(ADDR_T_STOP, t_Stop);
+    EEPROM.put(ADDR_T_NET, t_Net);
+    EEPROM.put(ADDR_T_TWINE, t_Twine);
+    EEPROM.put(ADDR_MAGIC, EEPROM_MAGIC_BYTE);
+  }
+
   pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
   densSensor.begin(); startSensor.begin(); endSensor.begin(); doorSensor.begin(); resetBtn.begin();
   pinMode(PIN_SWITCH_NET, INPUT_PULLUP); 
   horn.begin(); beacon.begin();
   pinMode(PIN_RELAY_TWINE, OUTPUT); pinMode(PIN_RELAY_NET, OUTPUT);
   motorOff(); beacon.setMode(0); 
+
+  wdt_enable(WDTO_2S); // Включаем защиту от зависаний (2 секунды)
 }
 
 void loop() {
+  wdt_reset(); // Сбрасываем сторожевой таймер. Если плата зависнет, она перезагрузится через 2с!
+
   densSensor.update(); startSensor.update(); endSensor.update(); doorSensor.update(); resetBtn.update();
   horn.update(); beacon.update(); 
   listenRS485();
 
-  // --- ОБРАБОТКА СТОРОЖЕВОГО ТАЙМЕРА (Watchdog) ---
-  // Если от пульта не было вестей 2 секунды - отключаем режим "Remote"
   if (isRemoteConnected && (millis() - lastMasterPacketTime > 2000)) {
     isRemoteConnected = false;
   }
@@ -224,21 +289,15 @@ void loop() {
 
   switch (currentState) {
     case WAIT_DENSITY:
-      if (densSensor.isHeldFor(cfg.plotnostLozh)) { horn.play(3, 300); beacon.setMode(1); stateTimer = millis(); currentState = WAIT_TRACTOR; } break;
+      // Используем настройку t_Dens (переводим секунды в мс)
+      if (densSensor.isHeldFor(t_Dens * 1000UL)) { horn.play(3, 300); beacon.setMode(1); stateTimer = millis(); currentState = WAIT_TRACTOR; } break;
     
     case WAIT_TRACTOR:
-      // ВЕТВЛЕНИЕ АВТО/РУЧНОЙ РЕЖИМ
       if (isRemoteConnected && rxData.isManualMode) {
-        // РУЧНОЙ РЕЖИМ: Мы не запускаем мотор. Ждем, пока тракторист аппаратно подаст 12В на мотор.
-        // Как только мотор дернет механизм, сработает датчик "Старт", и мы продолжим цикл.
-        if (startSensor.isPressed()) {
-          horn.play(1, 800); 
-          stateTimer = millis(); 
-          currentState = MOTOR_RUNNING_TIMER;
-        }
+        if (startSensor.isPressed()) { horn.play(1, 800); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; }
       } else {
-        // АВТО РЕЖИМ (Или пульт отключен): Пресс работает сам
-        if (millis() - stateTimer >= cfg.timeForStopTraktor) { motorOn(); stateTimer = millis(); currentState = WAIT_START_SENSOR; } 
+        // Используем настройку t_Stop
+        if (millis() - stateTimer >= (t_Stop * 1000UL)) { motorOn(); stateTimer = millis(); currentState = WAIT_START_SENSOR; } 
       }
       break;
 
@@ -247,7 +306,8 @@ void loop() {
       else if (millis() - stateTimer >= cfg.timeoutMotorMax) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } break;
     
     case MOTOR_RUNNING_TIMER:
-      if (millis() - stateTimer >= (getNetMode() ? cfg.timerNetRun : cfg.timerTwineRun)) { motorOff(); stateTimer = millis(); currentState = WAIT_END_SENSOR; } break;
+      // Используем настройки t_Net или t_Twine
+      if (millis() - stateTimer >= (getNetMode() ? (t_Net * 1000UL) : (t_Twine * 1000UL))) { motorOff(); stateTimer = millis(); currentState = WAIT_END_SENSOR; } break;
     
     case WAIT_END_SENSOR:
       if (endSensor.isPressed()) { horn.play(2, 400); doorWasOpened = false; currentState = WAIT_DOOR; }
@@ -255,7 +315,14 @@ void loop() {
     
     case WAIT_DOOR:
       if (doorSensor.isPressed() && !doorWasOpened) doorWasOpened = true;
-      else if (!doorSensor.isPressed() && doorWasOpened) { txData.totalBales++; txData.sessionBales++; doorWasOpened = false; beacon.setMode(0); currentState = WAIT_DENSITY; } break;
+      else if (!doorSensor.isPressed() && doorWasOpened) { 
+        // ТЮК ГОТОВ!
+        totalBales++; 
+        sessionBales++; 
+        EEPROM.put(ADDR_TOTAL_BALES, totalBales); // Сохраняем в память пресса
+        
+        doorWasOpened = false; beacon.setMode(0); currentState = WAIT_DENSITY; 
+      } break;
     
     case ERROR_STATE:
       if (millis() - stateTimer >= 4000) { horn.play(2, 200); stateTimer = millis(); } break;
