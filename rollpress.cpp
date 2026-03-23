@@ -283,17 +283,20 @@ void loop() {
     else if (currentState == RETURN_TO_HOME) { motorOff(); horn.play(1, 600); beacon.setMode(0); currentState = WAIT_DENSITY; }
 
     if (resetClicks == 5 && currentState == WAIT_DENSITY) {
-      resetClicks = 0; motorOn(); horn.play(1, 800); beacon.setMode(1); stateTimer = millis(); currentState = RETURN_TO_HOME;
-    }
+    resetClicks = 0; motorOn(); horn.play(1, 800); beacon.setMode(1); stateTimer = millis(); currentState = RETURN_TO_HOME;
   }
+}
 
-  switch (currentState) {
-    case WAIT_DENSITY:
-      // Используем настройку t_Dens (переводим секунды в мс)
-      if (densSensor.isHeldFor(t_Dens * 1000UL)) { horn.play(3, 300); beacon.setMode(1); stateTimer = millis(); currentState = WAIT_TRACTOR; } break;
-    
-    case WAIT_TRACTOR:
-      if (isRemoteConnected && rxData.isManualMode) {
+switch (currentState) {
+  case WAIT_DENSITY: {
+    // В ручном режиме ждем 1 секунду жестко. В авто - берем настройку t_Dens.
+    uint32_t delayDens = (isRemoteConnected && rxData.isManualMode) ? 1000UL : (t_Dens * 1000UL);
+    if (densSensor.isHeldFor(delayDens)) { horn.play(3, 300); beacon.setMode(1); stateTimer = millis(); currentState = WAIT_TRACTOR; } 
+    break;
+  }
+  
+  case WAIT_TRACTOR:
+    if (isRemoteConnected && rxData.isManualMode) {
         if (startSensor.isPressed()) { horn.play(1, 800); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; }
       } else {
         // Используем настройку t_Stop
