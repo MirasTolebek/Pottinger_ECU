@@ -81,6 +81,13 @@ unsigned long lastDisplayUpdate = 0;
 uint8_t screenPage = 0;              
 unsigned long screenTimer = 0;       
 
+// Переменные для секундомера (калибровка плотности)
+unsigned long stopwatchStartTime = 0;
+bool isStopwatchRunning = false;
+uint16_t stoppedTimeSec = 0;
+bool showStoppedTime = false;
+uint8_t prevLoopState = 0;
+
 // Переменные для Меню Настроек (Локальные, пока мы их редактируем)
 unsigned long comboTimer = 0;
 bool comboTriggered = false;
@@ -161,6 +168,31 @@ void loop() {
   swMode.update(); swNet.update(); btnScreen.update(); btnAction.update();
 
   if (millis() - lastPollTime >= 300) { pollSlave(); lastPollTime = millis(); }
+
+  // --- ЛОГИКА СЕКУНДОМЕРА ДЛЯ РУЧНОГО РЕЖИМА ---
+  if (swMode.isPressed()) {
+    if (slaveData.currentState == 1 && prevLoopState == 0) {
+      // Только что сработал датчик - запускаем секундомер!
+      stopwatchStartTime = millis();
+      isStopwatchRunning = true;
+      showStoppedTime = false;
+    }
+    if (isStopwatchRunning && btnAction.justPressed()) {
+      // Тракторист нажал кнопку пуска - останавливаем секундомер!
+      stoppedTimeSec = (millis() - stopwatchStartTime) / 1000;
+      isStopwatchRunning = false;
+      showStoppedTime = true;
+    }
+    if (slaveData.currentState == 0) {
+      // Сброс при новом цикле
+      isStopwatchRunning = false;
+      showStoppedTime = false;
+    }
+  } else {
+    isStopwatchRunning = false;
+    showStoppedTime = false;
+  }
+  prevLoopState = slaveData.currentState;
 
   // =================================================================================
   // ЛОГИКА МЕНЮ НАСТРОЕК (ВХОД И ВЫХОД)
@@ -269,7 +301,7 @@ void updateDisplay() {
     } else {
       switch (slaveData.currentState) {
         case 0: lcd.print(F("NABOR MASSY... ")); break; 
-        case 1: lcd.print(F("STOP TRAKTOR!  ")); break; 
+        case 1: lcd.print(swMode.isPressed() ? F("PLOTNOST:      ") : F("STOP TRAKTOR!  ")); break; 
         case 2: lcd.print(F("ZAHVAT...      ")); break; 
         case 3: lcd.print(F("OBVYAZKA...    ")); break; 
         case 4: lcd.print(F("OBREZKA...     ")); break; 
@@ -279,6 +311,14 @@ void updateDisplay() {
         case 8: lcd.print(F("VOZVRAT PLANKI ")); break; 
         default: lcd.print(F("N/A            ")); break; 
       }
+    }
+
+    // Отрисовка секундомера в правом верхнем углу (Поверх текста)
+    if (swMode.isPressed() && (isStopwatchRunning || showStoppedTime)) {
+      lcd.setCursor(10, 0);
+      char swBuf[6];
+      sprintf(swBuf, "%2us  ", isStopwatchRunning ? (millis() - stopwatchStartTime) / 1000 : stoppedTimeSec);
+      lcd.print(swBuf);
     }
 
     lcd.setCursor(15, 0);
