@@ -63,7 +63,7 @@ struct Config {
   
   // Настройки логики (High/Low) для разных модулей реле (Инверсия)
   const bool motorActiveHigh = true;  
-  const bool soundActiveHigh = false; // Реле гудка срабатывает на LOW
+  const bool soundActiveHigh = true; // Реле гудка срабатывает на LOW
   const bool lightActiveHigh = true;  
 };
 Config cfg;
