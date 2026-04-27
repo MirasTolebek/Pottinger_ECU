@@ -13,7 +13,7 @@
 
 #include <SoftwareSerial.h>
 #include <Wire.h>     // Библиотека для работы с шиной I2C (для внешнего EEPROM)
-#include <avr/wdt.h>  // Библиотека Сторожевого таймера (Hardware Watchdog)
+//#include <avr/wdt.h>  // Библиотека Сторожевого таймера (Hardware Watchdog)
 
 // =================================================================================
 // РАСПИНОВКА (PINS) - БЛОК ПРЕССА
@@ -63,7 +63,7 @@ struct Config {
   
   // Настройки логики (High/Low) для разных модулей реле (Инверсия)
   const bool motorActiveHigh = true;  
-  const bool soundActiveHigh = true; // Реле гудка срабатывает на LOW
+  const bool soundActiveHigh = true;
   const bool lightActiveHigh = true;  
 };
 Config cfg;
@@ -413,14 +413,14 @@ void setup() {
   motorOff(); beacon.setMode(0); 
 
   // Включаем аппаратный сторожевой таймер. При зависании кода плата уйдет в Reset
-  wdt_enable(WDTO_2S); 
+  //wdt_enable(WDTO_2S); 
 }
 
 // =================================================================================
 // ОСНОВНОЙ ЦИКЛ БЛОКА ПРЕССА
 // =================================================================================
 void loop() {
-  wdt_reset(); // Обнуление сторожевого таймера
+  //wdt_reset(); // Обнуление сторожевого таймера
 
   // Опрос физики
   densSensor.update(); startSensor.update(); endSensor.update(); doorSensor.update(); resetBtn.update();
@@ -481,7 +481,7 @@ void loop() {
       if (isRemoteConnected && rxData.isManualMode) {
         // Если ручной режим - мы сами мотор НЕ включаем. Ждем, пока тракторист нажмет аппаратную кнопку
         // которая аппаратно включит реле мотора. Как только мотор дернет планку, сработает датчик Старта.
-        if (startSensor.isPressed()) { horn.play(1, 800); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; }
+        if (startSensor.isPressed()) { horn.play(1, 200); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; }
       } else {
         // Авторежим: ждем установленное время t_Stop и программно запускаем мотор
         if (millis() - stateTimer >= (t_Stop * 1000UL)) { motorOn(); stateTimer = millis(); currentState = WAIT_START_SENSOR; } 
@@ -491,7 +491,7 @@ void loop() {
     // ШАГ 2: Ждем механического подтверждения начала обвязки
     case WAIT_START_SENSOR:
       if (startSensor.isPressed()) { 
-        horn.play(1, 800); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; 
+        horn.play(1, 200); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; 
       } 
       // Если мотор крутится, а датчик так и не сработал (порвалась цепь, сгорел мотор) - уходим в Аварию
       else if (millis() - stateTimer >= cfg.timeoutMotorMax) { 
@@ -523,7 +523,8 @@ void loop() {
     // ШАГ 5: Ожидание открытия и закрытия двери камеры (Выгрузка)
     case WAIT_DOOR:
       if (doorSensor.isPressed() && !doorWasOpened) {
-        doorWasOpened = true; // Зафиксировали факт открытия
+        doorWasOpened = true; // Зафиксировали факт открытия 
+        horn.play(1, 120);     // Гудок при открыти двери
       }
       else if (!doorSensor.isPressed() && doorWasOpened) { 
         // Дверь закрылась! Цикл успешно завершен.
@@ -534,6 +535,7 @@ void loop() {
         
         doorWasOpened = false; 
         beacon.setMode(0); // Выключаем маяк
+        horn.play(2, 120); // Гудок о закрытии двери
         currentState = WAIT_DENSITY; // Возврат в начало
       } 
       break;
