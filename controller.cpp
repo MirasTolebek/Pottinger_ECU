@@ -1,415 +1,345 @@
 /*
  * =====================================================================================
- * ПРОЕКТ: Система управления рулонным пресс-подборщиком (Блок Пресса / Slave)
- * ВЕРСИЯ: 1.5 (Внедрен I2C Timeout для защиты шины EEPROM от помех)
+ * ПРОЕКТ: Система управления рулонным пресс-подборщиком (Блок Пульта / Master)
+ * ВЕРСИЯ: 1.9 (Внедрен I2C Timeout для защиты от зависаний дисплея из-за помех)
  * =====================================================================================
  */
 
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <SoftwareSerial.h>
-#include <Wire.h>     
+
+// --- НАСТРОЙКИ ЭКРАНА ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
 // =================================================================================
-// РАСПИНОВКА (PINS) - БЛОК ПРЕССА
+// РАСПИНОВКА ПУЛЬТА
 // =================================================================================
-#define PIN_DENSITY        2    
-#define PIN_S_START        3    
-#define PIN_S_END          4    
-#define PIN_DOOR           5    
-#define PIN_RELAY_TWINE    6    
-#define PIN_RELAY_SOUND    7    
-#define PIN_RESET          8    
-#define PIN_RELAY_LIGHT    9    
-#define PIN_RELAY_NET      10   
-#define PIN_SWITCH_NET     11   
+#define PIN_SW_MODE      4    
+#define PIN_SW_NET       2    
+#define PIN_BTN_SCREEN   3    
+#define PIN_BTN_ACTION   11   
+#define PIN_BUZZER       12   // Зуммер в кабине (Active-LOW)
 
-#define PIN_RS485_RX       A0   
-#define PIN_RS485_TX       A1   
-#define PIN_RS485_EN       A2   
+#define PIN_RS485_RX     8    
+#define PIN_RS485_TX     9    
+#define PIN_RS485_EN     10   
 
 SoftwareSerial rs485(PIN_RS485_RX, PIN_RS485_TX);
 
 // =================================================================================
-// ВНЕШНИЙ EEPROM (I2C AT24Cxx)
-// =================================================================================
-#define EEPROM_ADDR 0x50       
-#define EEPROM_MAGIC_BYTE 0x44 
-#define ADDR_MAGIC        0    
-#define ADDR_TOTAL_BALES  1    
-#define ADDR_T_DENS       5    
-#define ADDR_T_STOP       6    
-#define ADDR_T_NET        7    
-#define ADDR_T_TWINE      8    
-#define ADDR_SOUND_MODE   9    
-
-uint32_t totalBales = 0;
-uint8_t t_Dens = 1;   
-uint8_t t_Stop = 4;
-uint8_t t_Net = 2;
-uint8_t t_Twine = 3;
-uint8_t soundMode = 2; 
-
-struct Config {
-  const uint32_t timeoutMotorMax = 10000;   
-  const uint32_t timeoutEndSensor = 15000;  
-  const uint32_t timeoutReturnHome = 10000; 
-  const uint32_t debounce = 50;             
-  
-  const bool motorActiveHigh = true;  
-  const bool soundActiveHigh = true;  
-  const bool lightActiveHigh = true;  
-};
-Config cfg;
-
-// =================================================================================
-// СТРУКТУРЫ ДАННЫХ ДЛЯ ОБМЕНА ПО RS485
+// СТРУКТУРЫ ДАННЫХ
 // =================================================================================
 struct MasterData { 
   bool doReset; bool isManualMode; bool isNetMode; bool saveSettings; 
   uint8_t timeoutDens; uint8_t timeoutStop; uint8_t timeoutNet; uint8_t timeoutTwine;
   uint8_t soundMode; 
 };
-MasterData rxData;
+MasterData txData = {false, false, false, false, 1, 4, 2, 3, 2}; 
 
 struct SlaveData {
   uint8_t currentState; uint16_t sessionBales; uint32_t totalBales;   
   uint8_t t_Dens; uint8_t t_Stop; uint8_t t_Net; uint8_t t_Twine;
   uint8_t soundMode; 
 };
-SlaveData txData; 
+SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 2}; 
 
-unsigned long lastMasterPacketTime = 0;
-bool isRemoteConnected = false;
-
-// =================================================================================
-// ФУНКЦИИ РАБОТЫ С EEPROM
-// =================================================================================
-void writeEEPROM_Byte(uint16_t mem_addr, uint8_t data) {
-  Wire.beginTransmission(EEPROM_ADDR);
-  Wire.write((int)(mem_addr >> 8));   
-  Wire.write((int)(mem_addr & 0xFF)); 
-  Wire.write(data);                   
-  Wire.endTransmission();
-  delay(5); 
-}
-
-uint8_t readEEPROM_Byte(uint16_t mem_addr) {
-  uint8_t data = 0xFF;
-  Wire.beginTransmission(EEPROM_ADDR);
-  Wire.write((int)(mem_addr >> 8));
-  Wire.write((int)(mem_addr & 0xFF));
-  Wire.endTransmission();
-  Wire.requestFrom(EEPROM_ADDR, 1);
-  if (Wire.available()) data = Wire.read();
-  return data;
-}
-
-void writeEEPROM_Long(uint16_t mem_addr, uint32_t data) {
-  writeEEPROM_Byte(mem_addr, (data & 0xFF));
-  writeEEPROM_Byte(mem_addr + 1, ((data >> 8) & 0xFF));
-  writeEEPROM_Byte(mem_addr + 2, ((data >> 16) & 0xFF));
-  writeEEPROM_Byte(mem_addr + 3, ((data >> 24) & 0xFF));
-}
-
-uint32_t readEEPROM_Long(uint16_t mem_addr) {
-  uint32_t data = 0;
-  data = readEEPROM_Byte(mem_addr);
-  data |= ((uint32_t)readEEPROM_Byte(mem_addr + 1) << 8);
-  data |= ((uint32_t)readEEPROM_Byte(mem_addr + 2) << 16);
-  data |= ((uint32_t)readEEPROM_Byte(mem_addr + 3) << 24);
-  return data;
-}
+bool isConnected = false;        
+unsigned long lastPollTime = 0;  
+byte noLinkChar[8] = { 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b11111, 0b00000 };
 
 // =================================================================================
-// КЛАССЫ ПЕРИФЕРИИ
+// КЛАССЫ
 // =================================================================================
-class Sensor {
+class Button {
   private:
-    uint8_t pin; bool invertLogic; unsigned long lastChange; unsigned long stateChangeTime;
-    bool state; bool lastReading; bool stateChanged;
+    uint8_t pin; unsigned long lastChange; bool state; bool lastReading; bool stateChanged;
   public:
-    Sensor(uint8_t p, bool inv = true) : pin(p), invertLogic(inv), lastChange(0), stateChangeTime(0), state(false), lastReading(false), stateChanged(false) {}
-    void begin() { pinMode(pin, invertLogic ? INPUT_PULLUP : INPUT); }
+    Button(uint8_t p) : pin(p), lastChange(0), state(false), lastReading(false), stateChanged(false) {}
+    void begin() { pinMode(pin, INPUT_PULLUP); }
     void update() {
-      stateChanged = false; bool reading = digitalRead(pin);
-      if (invertLogic) reading = !reading; 
+      stateChanged = false; bool reading = !digitalRead(pin); 
       if (reading != lastReading) lastChange = millis();
-      if ((millis() - lastChange) >= cfg.debounce) {
-        if (state != reading) { state = reading; stateChanged = true; stateChangeTime = millis(); }
+      if ((millis() - lastChange) > 50) {
+        if (state != reading) { state = reading; stateChanged = true; }
       }
       lastReading = reading;
     }
-    bool isPressed() { return state; } 
-    bool justPressed() { return (state == true && stateChanged == true); } 
-    bool isHeldFor(uint32_t time) { return state && ((millis() - stateChangeTime) >= time); } 
+    bool isPressed() { return state; }                                         
+    bool justPressed() { return (state == true && stateChanged == true); }     
+    bool isHeldFor(uint32_t time) { return state && ((millis() - lastChange) >= time); } 
 };
 
-class Signaler {
+class Beeper {
   private:
-    uint8_t pin; int beepsLeft = 0; unsigned long lastToggle = 0; bool isRelayOn = false; uint32_t duration;
-    void turnOn()  { digitalWrite(pin, cfg.soundActiveHigh ? HIGH : LOW); }
-    void turnOff() { digitalWrite(pin, cfg.soundActiveHigh ? LOW : HIGH); }
+    uint8_t pin; int beepsLeft = 0; unsigned long lastToggle = 0; bool isOn = false; uint32_t duration;
+    uint8_t patternType = 0; 
   public:
-    Signaler(uint8_t p) : pin(p) {}
-    void begin() { pinMode(pin, OUTPUT); turnOff(); }
-    
+    Beeper(uint8_t p) : pin(p) {}
+    void begin() { 
+      pinMode(pin, OUTPUT); 
+      digitalWrite(pin, HIGH); 
+    }
     void play(int count, uint32_t dur = 300) { 
-      bool shouldPlay = true;
-      if (isRemoteConnected && soundMode == 1) { 
-          shouldPlay = false; 
-      }
-      if (shouldPlay) {
-        beepsLeft = count * 2; duration = dur; isRelayOn = true; 
-        turnOn(); lastToggle = millis(); beepsLeft--; 
-      }
+      if (slaveData.soundMode == 0) return; 
+      patternType = 0;
+      beepsLeft = count * 2; duration = dur; isOn = true; 
+      digitalWrite(pin, LOW);  
+      lastToggle = millis(); beepsLeft--; 
     }
-    
+    void playShortLong() {
+      if (slaveData.soundMode == 0) return;
+      patternType = 1;
+      beepsLeft = 4; 
+      isOn = true;
+      digitalWrite(pin, LOW); 
+      lastToggle = millis(); beepsLeft--;
+    }
     void update() {
-      if (beepsLeft > 0 && (millis() - lastToggle >= duration)) {
-        isRelayOn = !isRelayOn; if (isRelayOn) turnOn(); else turnOff();
-        lastToggle = millis(); beepsLeft--;
-      }
-    }
-    bool isBusy() { return beepsLeft > 0; } 
-};
-
-class LightController {
-  private:
-    uint8_t pin; uint8_t currentMode; unsigned long lastToggle; bool state;
-    void turnOn()  { digitalWrite(pin, cfg.lightActiveHigh ? HIGH : LOW); }
-    void turnOff() { digitalWrite(pin, cfg.lightActiveHigh ? LOW : HIGH); }
-  public:
-    LightController(uint8_t p) : pin(p), currentMode(0), lastToggle(0), state(false) {}
-    void begin() { pinMode(pin, OUTPUT); turnOff(); }
-    void setMode(uint8_t mode) { currentMode = mode; if (mode == 0) { state = false; turnOff(); } else if (mode == 1) { state = true; turnOn(); } }
-    void update() {
-      if (currentMode == 2) { if (millis() - lastToggle >= 300) { state = !state; if (state) turnOn(); else turnOff(); lastToggle = millis(); } } 
-      else if (currentMode == 3) { if (millis() - lastToggle >= 1000) { state = !state; if (state) turnOn(); else turnOff(); lastToggle = millis(); } }
-    }
-};
-
-Sensor densSensor(PIN_DENSITY, true); 
-Sensor startSensor(PIN_S_START, true);
-Sensor endSensor(PIN_S_END, true);
-Sensor doorSensor(PIN_DOOR, false); 
-Sensor resetBtn(PIN_RESET, true); 
-
-Signaler horn(PIN_RELAY_SOUND);
-LightController beacon(PIN_RELAY_LIGHT);
-
-enum BalerState { WAIT_DENSITY, WAIT_TRACTOR, WAIT_START_SENSOR, MOTOR_RUNNING_TIMER, WAIT_END_SENSOR, WAIT_DOOR, ERROR_STATE, TEST_MODE, RETURN_TO_HOME };
-BalerState currentState = WAIT_DENSITY; 
-
-unsigned long stateTimer = 0;        
-unsigned long testModeStartTime = 0; 
-bool doorWasOpened = false;          
-uint8_t resetClicks = 0;             
-unsigned long lastResetClickTime = 0;
-uint16_t sessionBales = 0;
-
-bool getNetMode() { 
-  if (isRemoteConnected) return rxData.isNetMode; 
-  else return !digitalRead(PIN_SWITCH_NET); 
-}
-
-void motorOn() { 
-  if (getNetMode()) digitalWrite(PIN_RELAY_NET, cfg.motorActiveHigh ? HIGH : LOW);
-  else digitalWrite(PIN_RELAY_TWINE, cfg.motorActiveHigh ? HIGH : LOW);
-}
-
-void motorOff() { 
-  digitalWrite(PIN_RELAY_TWINE, cfg.motorActiveHigh ? LOW : HIGH);
-  digitalWrite(PIN_RELAY_NET, cfg.motorActiveHigh ? LOW : HIGH);
-}
-
-void executeEmergencyReset() {
-  if (currentState != WAIT_DENSITY && currentState != TEST_MODE) {  
-    motorOff(); horn.play(1, 600); beacon.setMode(0); doorWasOpened = doorSensor.isPressed(); currentState = WAIT_DENSITY;           
-  }
-}
-
-void sendRS485Reply() {
-  digitalWrite(PIN_RS485_EN, HIGH); delay(2);
-  
-  txData.currentState = currentState; 
-  txData.sessionBales = sessionBales;
-  txData.totalBales = totalBales;
-  txData.t_Dens = t_Dens;
-  txData.t_Stop = t_Stop;
-  txData.t_Net = t_Net;
-  txData.t_Twine = t_Twine;
-  txData.soundMode = soundMode; 
-
-  rs485.write(0xAA); 
-  uint8_t crc = 0; uint8_t* ptr = (uint8_t*)&txData;
-  for (uint16_t i = 0; i < sizeof(SlaveData); i++) { rs485.write(ptr[i]); crc ^= ptr[i]; }
-  rs485.write(crc); rs485.flush(); digitalWrite(PIN_RS485_EN, LOW); 
-}
-
-void listenRS485() {
-  if (rs485.available() > 0) { 
-    if (rs485.read() == 0xBB) { 
-      unsigned long pStart = millis();
-      while (rs485.available() < sizeof(MasterData) + 1) { if (millis() - pStart > 30) break; }
-
-      if (rs485.available() >= sizeof(MasterData) + 1) { 
-        uint8_t crc = 0; uint8_t* ptr = (uint8_t*)&rxData;
-        for (uint16_t i = 0; i < sizeof(MasterData); i++) { ptr[i] = rs485.read(); crc ^= ptr[i]; }
-        if (crc == rs485.read()) {
-          lastMasterPacketTime = millis();
-          isRemoteConnected = true; 
-
-          if (rxData.saveSettings) {
-            t_Dens = rxData.timeoutDens;
-            t_Stop = rxData.timeoutStop;
-            t_Net = rxData.timeoutNet;
-            t_Twine = rxData.timeoutTwine;
-            soundMode = rxData.soundMode; 
-            
-            writeEEPROM_Byte(ADDR_T_DENS, t_Dens);
-            writeEEPROM_Byte(ADDR_T_STOP, t_Stop);
-            writeEEPROM_Byte(ADDR_T_NET, t_Net);
-            writeEEPROM_Byte(ADDR_T_TWINE, t_Twine);
-            writeEEPROM_Byte(ADDR_SOUND_MODE, soundMode); 
-          }
-
-          if (rxData.doReset) executeEmergencyReset(); 
-          sendRS485Reply(); 
+      if (beepsLeft > 0) {
+        uint32_t currentDur = duration; 
+        if (patternType == 1) {
+          if (beepsLeft == 3) currentDur = 150;      
+          else if (beepsLeft == 2) currentDur = 150; 
+          else if (beepsLeft == 1) currentDur = 800; 
+        }
+        if (millis() - lastToggle >= currentDur) {
+          isOn = !isOn; 
+          digitalWrite(pin, isOn ? LOW : HIGH); 
+          lastToggle = millis(); beepsLeft--;
         }
       }
+      else if (beepsLeft == 0 && isOn) {
+        isOn = false;
+        digitalWrite(pin, HIGH); 
+      }
     }
-  }
-}
+};
 
+Button swMode(PIN_SW_MODE); Button swNet(PIN_SW_NET);
+Button btnScreen(PIN_BTN_SCREEN); Button btnAction(PIN_BTN_ACTION);
+Beeper cabinBuzzer(PIN_BUZZER); 
+
+bool resetCommandSent = false;       
+unsigned long lastDisplayUpdate = 0; 
+uint8_t screenPage = 0;              
+unsigned long screenTimer = 0;       
+
+unsigned long stopwatchStartTime = 0; bool isStopwatchRunning = false;
+uint16_t stoppedTimeSec = 0; bool showStoppedTime = false;
+uint8_t prevLoopState = 0; 
+
+unsigned long comboTimer = 0; bool comboTriggered = false;
+uint8_t settingIndex = 0; 
+uint8_t edit_t_Dens, edit_t_Stop, edit_t_Net, edit_t_Twine, edit_soundMode; 
+bool pendingSave = false; 
+
+// =================================================================================
 void setup() {
-  Wire.begin(); 
+  pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
+  swMode.begin(); swNet.begin(); btnScreen.begin(); btnAction.begin();
+  cabinBuzzer.begin(); 
   
-  // --- АНТИЗАВИСАНИЕ ШИНЫ EEPROM (I2C TIMEOUT) ---
-  // Защита на случай жесткой помехи во время записи/чтения
+  lcd.init(); 
+  
+  // --- АНТИЗАВИСАНИЕ ДИСПЛЕЯ (I2C TIMEOUT) ---
+  // Если экран из-за наводки перестанет отвечать, Ардуино не зависнет, 
+  // а сбросит шину через 25 миллисекунд и продолжит работу кода!
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.setWireTimeout(25000, true);
   #endif
+  
+  lcd.backlight(); lcd.createChar(0, noLinkChar); 
+  
+  lcd.setCursor(0, 0); lcd.print(F("BALER CONTROL")); 
+  lcd.setCursor(0, 1); lcd.print(F("SYSTEM START..."));
+  
+  digitalWrite(PIN_BUZZER, LOW); delay(100); digitalWrite(PIN_BUZZER, HIGH); 
+  delay(1000); 
+  lcd.clear();
+}
 
-  uint8_t magic = readEEPROM_Byte(ADDR_MAGIC);
-  if (magic == EEPROM_MAGIC_BYTE) {
-    totalBales = readEEPROM_Long(ADDR_TOTAL_BALES);
-    t_Dens = readEEPROM_Byte(ADDR_T_DENS);
-    t_Stop = readEEPROM_Byte(ADDR_T_STOP);
-    t_Net = readEEPROM_Byte(ADDR_T_NET);
-    t_Twine = readEEPROM_Byte(ADDR_T_TWINE);
-    soundMode = readEEPROM_Byte(ADDR_SOUND_MODE);
-    if (soundMode > 2) soundMode = 2; 
-  } else {
-    writeEEPROM_Long(ADDR_TOTAL_BALES, totalBales);
-    writeEEPROM_Byte(ADDR_T_DENS, t_Dens);
-    writeEEPROM_Byte(ADDR_T_STOP, t_Stop);
-    writeEEPROM_Byte(ADDR_T_NET, t_Net);
-    writeEEPROM_Byte(ADDR_T_TWINE, t_Twine);
-    writeEEPROM_Byte(ADDR_SOUND_MODE, soundMode);
-    writeEEPROM_Byte(ADDR_MAGIC, EEPROM_MAGIC_BYTE);
+void pollSlave() {
+  txData.isManualMode = swMode.isPressed(); txData.isNetMode = swNet.isPressed();
+  if (pendingSave) { txData.saveSettings = true; }
+  while (rs485.available()) rs485.read();
+  
+  digitalWrite(PIN_RS485_EN, HIGH); delay(2); rs485.write(0xBB); 
+  uint8_t crc = 0; uint8_t* ptr = (uint8_t*)&txData;
+  for (uint16_t i = 0; i < sizeof(MasterData); i++) { rs485.write(ptr[i]); crc ^= ptr[i]; }
+  rs485.write(crc); rs485.flush(); digitalWrite(PIN_RS485_EN, LOW); 
+  if (pendingSave) { txData.saveSettings = false; pendingSave = false; }
+
+  unsigned long waitStart = millis(); bool replied = false;
+  while (millis() - waitStart < 80) {
+    if (rs485.available() > 0) {
+      if (rs485.read() == 0xAA) { 
+        unsigned long pStart = millis();
+        while (rs485.available() < sizeof(SlaveData) + 1) { if (millis() - pStart > 40) break; }
+        if (rs485.available() >= sizeof(SlaveData) + 1) {
+          uint8_t rCrc = 0; uint8_t* rPtr = (uint8_t*)&slaveData;
+          for (uint16_t i = 0; i < sizeof(SlaveData); i++) { rPtr[i] = rs485.read(); rCrc ^= rPtr[i]; }
+          if (rCrc == rs485.read()) { replied = true; txData.doReset = false; }
+        }
+        break; 
+      }
+    }
   }
-
-  pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
-  densSensor.begin(); startSensor.begin(); endSensor.begin(); doorSensor.begin(); resetBtn.begin();
-  pinMode(PIN_SWITCH_NET, INPUT_PULLUP); 
-  horn.begin(); beacon.begin();
-  pinMode(PIN_RELAY_TWINE, OUTPUT); pinMode(PIN_RELAY_NET, OUTPUT);
-  motorOff(); beacon.setMode(0); 
+  isConnected = replied; 
 }
 
 void loop() {
-  // Постоянная очистка флага ошибки I2C
+  // Очистка флага таймаута дисплея, если он сработал
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.clearWireTimeoutFlag();
   #endif
 
-  densSensor.update(); startSensor.update(); endSensor.update(); doorSensor.update(); resetBtn.update();
-  horn.update(); beacon.update(); 
-  listenRS485();
+  swMode.update(); swNet.update(); btnScreen.update(); btnAction.update();
+  cabinBuzzer.update(); 
 
-  if (isRemoteConnected && (millis() - lastMasterPacketTime > 2000)) {
-    isRemoteConnected = false;
+  if (millis() - lastPollTime >= 300) { pollSlave(); lastPollTime = millis(); }
+
+  if (slaveData.currentState != prevLoopState && isConnected) {
+    uint8_t curr = slaveData.currentState;
+    uint8_t prev = prevLoopState;
+
+    if (curr == 1) { cabinBuzzer.play(3, 400); }
+    else if (curr == 2 || (curr == 3 && prev < 2)) { cabinBuzzer.play(1, 250); }
+    else if (curr == 5) { cabinBuzzer.playShortLong(); }
+    else if (curr == 0 && prev == 5) { cabinBuzzer.play(2, 200); }
+    else if (curr == 6 && prev != 6) { cabinBuzzer.play(10, 200); }
   }
 
-  bool isResetJustPressed = resetBtn.justPressed();
-
-  if (resetBtn.isHeldFor(10000) && currentState != TEST_MODE) {
-    motorOff(); horn.play(1, 100); beacon.setMode(3); currentState = TEST_MODE; testModeStartTime = millis(); resetClicks = 0; 
-  }
-
-  if (isResetJustPressed && currentState != TEST_MODE) {
-    if (millis() - lastResetClickTime <= 600) resetClicks++; else resetClicks = 1; 
-    lastResetClickTime = millis();
-    if (currentState != WAIT_DENSITY && currentState != RETURN_TO_HOME) { executeEmergencyReset(); } 
-    else if (currentState == RETURN_TO_HOME) { motorOff(); horn.play(1, 600); beacon.setMode(0); currentState = WAIT_DENSITY; }
-    if (resetClicks == 5 && currentState == WAIT_DENSITY) {
-      resetClicks = 0; motorOn(); horn.play(1, 800); beacon.setMode(1); stateTimer = millis(); currentState = RETURN_TO_HOME;
+  if (swMode.isPressed()) {
+    if (slaveData.currentState == 1 && prevLoopState == 0) {
+      stopwatchStartTime = millis(); isStopwatchRunning = true; showStoppedTime = false;
     }
-  }
-
-  // --- ЛОГИКА АВТОМАТА СОСТОЯНИЙ И ЗВУКОВ ---
-  switch (currentState) {
-    case WAIT_DENSITY: {
-      uint32_t delayDens = (isRemoteConnected && rxData.isManualMode) ? 1000UL : (t_Dens * 1000UL);
-      if (densSensor.isHeldFor(delayDens)) { 
-        horn.play(3, 300); 
-        beacon.setMode(1); stateTimer = millis(); currentState = WAIT_TRACTOR; 
-      } 
-      break;
+    if (isStopwatchRunning && btnAction.justPressed()) {
+      stoppedTimeSec = (millis() - stopwatchStartTime) / 1000;
+      isStopwatchRunning = false; showStoppedTime = true; 
     }
-    case WAIT_TRACTOR:
-      if (isRemoteConnected && rxData.isManualMode) {
-        if (startSensor.isPressed()) { 
-          horn.play(1, 200); 
-          stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; 
+    if (slaveData.currentState == 0) { isStopwatchRunning = false; showStoppedTime = false; }
+  } else { isStopwatchRunning = false; showStoppedTime = false; }
+  
+  prevLoopState = slaveData.currentState; 
+
+  if (btnScreen.isPressed() && btnAction.isPressed() && isConnected) {
+    if (swMode.isPressed()) {
+      if (millis() - comboTimer >= 500) { 
+        lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); comboTimer = millis();
+      }
+    } else {
+      if (millis() - comboTimer >= 2000 && !comboTriggered) {
+        comboTriggered = true; 
+        if (screenPage != 2) {
+          screenPage = 2; settingIndex = 0;
+          edit_t_Dens = slaveData.t_Dens; edit_t_Stop = slaveData.t_Stop; 
+          edit_t_Net = slaveData.t_Net; edit_t_Twine = slaveData.t_Twine;
+          edit_soundMode = slaveData.soundMode; 
+          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("== NASTROYKI ==")); delay(1000); lcd.clear();
+        } else {
+          txData.timeoutDens = edit_t_Dens; txData.timeoutStop = edit_t_Stop; 
+          txData.timeoutNet = edit_t_Net; txData.timeoutTwine = edit_t_Twine;
+          txData.soundMode = edit_soundMode; 
+          pendingSave = true; screenPage = 0;
+          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SOHRANENO V PRES")); delay(1000); lcd.clear();
         }
-      } else {
-        if (millis() - stateTimer >= (t_Stop * 1000UL)) { 
-          motorOn(); stateTimer = millis(); currentState = WAIT_START_SENSOR; 
-        } 
       }
-      break;
-    case WAIT_START_SENSOR:
-      if (startSensor.isPressed()) { 
-        horn.play(1, 200); 
-        stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; 
-      } 
-      else if (millis() - stateTimer >= cfg.timeoutMotorMax) { 
-        motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; 
-      } 
-      break;
-    case MOTOR_RUNNING_TIMER:
-      if (millis() - stateTimer >= (getNetMode() ? (t_Net * 1000UL) : (t_Twine * 1000UL))) { 
-        motorOff(); stateTimer = millis(); currentState = WAIT_END_SENSOR; 
-      } 
-      break;
-    case WAIT_END_SENSOR:
-      if (endSensor.isPressed()) { 
-        horn.play(2, 400); 
-        doorWasOpened = false; currentState = WAIT_DOOR; 
+    }
+  } else { comboTimer = millis(); comboTriggered = false; }
+
+  if (screenPage == 2) { 
+    if (btnScreen.justPressed() && !btnAction.isPressed()) { 
+      settingIndex++; 
+      if (settingIndex > 4) settingIndex = 0; 
+      lcd.clear(); 
+    }
+    
+    if (btnAction.justPressed() && !btnScreen.isPressed()) {
+      if (swMode.isPressed()) { lcd.setCursor(0, 1); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); } 
+      else {
+        uint8_t *valPtr;
+        if (settingIndex == 0) valPtr = &edit_t_Dens; 
+        else if (settingIndex == 1) valPtr = &edit_t_Stop;
+        else if (settingIndex == 2) valPtr = &edit_t_Net; 
+        else if (settingIndex == 3) valPtr = &edit_t_Twine;
+        else if (settingIndex == 4) valPtr = &edit_soundMode; 
+        
+        if (settingIndex == 4) { 
+          if (!swNet.isPressed()) { if (*valPtr < 2) (*valPtr)++; } else { if (*valPtr > 0) (*valPtr)--; }
+        } else { 
+          if (!swNet.isPressed()) { if (*valPtr < 20) (*valPtr)++; } else { if (*valPtr > 1) (*valPtr)--; }                     
+        }
       }
-      else if (millis() - stateTimer >= cfg.timeoutEndSensor) { 
-        beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; 
-      } 
-      break;
-    case WAIT_DOOR:
-      if (doorSensor.isPressed() && !doorWasOpened) doorWasOpened = true;
-      else if (!doorSensor.isPressed() && doorWasOpened) { 
-        horn.play(2, 150); 
-        totalBales++; sessionBales++; writeEEPROM_Long(ADDR_TOTAL_BALES, totalBales); 
-        doorWasOpened = false; beacon.setMode(0); currentState = WAIT_DENSITY; 
-      } 
-      break;
-    case ERROR_STATE:
-      if (millis() - stateTimer >= 4000) { 
-        horn.play(2, 200); 
-        stateTimer = millis(); 
-      } 
-      break;
-    case RETURN_TO_HOME:
-      if (endSensor.isPressed()) { motorOff(); horn.play(2, 400); beacon.setMode(0); currentState = WAIT_DENSITY; }
-      else if (millis() - stateTimer >= cfg.timeoutReturnHome) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } break;
-    case TEST_MODE:
-      if (millis() - testModeStartTime >= 60000) { horn.play(2, 400); beacon.setMode(0); doorWasOpened = doorSensor.isPressed(); currentState = WAIT_DENSITY; } 
-      else { if (!horn.isBusy()) { digitalWrite(PIN_RELAY_SOUND, (densSensor.isPressed() || startSensor.isPressed() || endSensor.isPressed() || doorSensor.isPressed()) ? (cfg.soundActiveHigh ? HIGH : LOW) : (cfg.soundActiveHigh ? LOW : HIGH)); } } break;
+    }
+  } else {
+    if (btnScreen.justPressed() && !btnAction.isPressed()) {
+      screenPage = (screenPage == 0) ? 1 : 0; screenTimer = millis(); lcd.clear(); updateDisplay(); lastDisplayUpdate = millis();
+    }
+    if (!swMode.isPressed()) {
+      if (btnAction.isHeldFor(1000) && !resetCommandSent && !btnScreen.isPressed()) {
+        txData.doReset = true; resetCommandSent = true; 
+        screenPage = 0; lcd.clear(); lcd.setCursor(0, 0); lcd.print(F(">> SBROS OK <<  ")); delay(1000); lcd.clear();
+      }
+      if (!btnAction.isPressed()) resetCommandSent = false;
+    }
+    if (screenPage == 1 && (millis() - screenTimer >= 5000)) { screenPage = 0; lcd.clear(); }
+  }
+
+  if (millis() - lastDisplayUpdate > 200) { updateDisplay(); lastDisplayUpdate = millis(); }
+}
+
+void updateDisplay() {
+  if (screenPage == 0) {
+    lcd.setCursor(0, 0);
+    if (swMode.isPressed() && btnAction.isPressed()) { lcd.print(F("PUSK MOTORA!   ")); } 
+    else {
+      switch (slaveData.currentState) {
+        case 0: lcd.print(F("NABOR MASSY... ")); break; 
+        case 1: lcd.print(swMode.isPressed() ? F("PLOTNOST:      ") : F("STOP TRAKTOR!  ")); break; 
+        case 2: lcd.print(F("ZAHVAT...      ")); break; 
+        case 3: lcd.print(F("OBVYAZKA...    ")); break; 
+        case 4: lcd.print(F("OBREZKA...     ")); break; 
+        case 5: lcd.print(F("OTKROY DVER!   ")); break; 
+        case 6: lcd.print(F("SBOY! PROVER!  ")); break; 
+        case 7: lcd.print(F("TEST REZHIM    ")); break; 
+        case 8: lcd.print(F("VOZVRAT PLANKI ")); break; 
+        default: lcd.print(F("N/A            ")); break; 
+      }
+    }
+    if (swMode.isPressed() && (isStopwatchRunning || showStoppedTime)) {
+      lcd.setCursor(10, 0); char swBuf[6]; sprintf(swBuf, "%2us  ", isStopwatchRunning ? (millis() - stopwatchStartTime) / 1000 : stoppedTimeSec); lcd.print(swBuf);
+    }
+    lcd.setCursor(15, 0); if (!isConnected) lcd.write(0); else lcd.print(F(" ")); 
+    lcd.setCursor(0, 1);
+    char buffer[17]; char modesStr[9];
+    strcpy(modesStr, swMode.isPressed() ? "[R]" : "[A]"); strcat(modesStr, swNet.isPressed() ? "[SET]" : "[SHP]"); 
+    sprintf(buffer, "%-8s%8u", modesStr, slaveData.sessionBales); lcd.print(buffer); 
+  } else if (screenPage == 1) {
+    lcd.setCursor(0, 0); lcd.print(F("TOTAL RULONOV:  ")); lcd.setCursor(15, 0); if (!isConnected) lcd.write(0);
+    lcd.setCursor(0, 1); char buffer[17]; sprintf(buffer, "      %-10lu", slaveData.totalBales); lcd.print(buffer);
+  } else if (screenPage == 2) {
+    lcd.setCursor(0, 0); lcd.print(F("SET: "));
+    switch (settingIndex) {
+      case 0: lcd.print(F("PLOTNOST  ")); break; 
+      case 1: lcd.print(F("TRACTOR   ")); break;
+      case 2: lcd.print(F("SETKA     ")); break; 
+      case 3: lcd.print(F("SHPAGAT   ")); break;
+      case 4: lcd.print(F("ZVUK      ")); break; 
+    }
+    lcd.setCursor(0, 1); 
+    
+    if (settingIndex == 4) {
+      lcd.print(F("REZH: "));
+      if (edit_soundMode == 0) lcd.print(F("TOLKO PRES"));
+      else if (edit_soundMode == 1) lcd.print(F("TOLKO PULT"));
+      else if (edit_soundMode == 2) lcd.print(F("PRES+PULT "));
+    } else {
+      lcd.print(F("VREMYA: "));
+      uint8_t val = 0;
+      if (settingIndex == 0) val = edit_t_Dens; else if (settingIndex == 1) val = edit_t_Stop;
+      else if (settingIndex == 2) val = edit_t_Net; else if (settingIndex == 3) val = edit_t_Twine;
+      char buffer[10]; sprintf(buffer, "%2u sek  ", val); lcd.print(buffer);
+    }
   }
 }
