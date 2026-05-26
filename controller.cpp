@@ -1,25 +1,20 @@
 /*
- * =====================================================================================
- * ПРОЕКТ: Система управления рулонным пресс-подборщиком (Блок Пульта / Master)
- * ВЕРСИЯ: 1.9 (Внедрен I2C Timeout для защиты от зависаний дисплея из-за помех)
- * =====================================================================================
+ * ПРОЕКТ: Система управления пресс-подборщиком (Блок Пульта / Master)
+ * ВЕРСИЯ: 2.2 (Исправлен UB с указателем, безопасный Soft Reset с cli())
  */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <SoftwareSerial.h>
 
-// --- НАСТРОЙКИ ЭКРАНА ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// =================================================================================
 // РАСПИНОВКА ПУЛЬТА
-// =================================================================================
 #define PIN_SW_MODE      4    
 #define PIN_SW_NET       2    
 #define PIN_BTN_SCREEN   3    
 #define PIN_BTN_ACTION   11   
-#define PIN_BUZZER       12   // Зуммер в кабине (Active-LOW)
+#define PIN_BUZZER       12   
 
 #define PIN_RS485_RX     8    
 #define PIN_RS485_TX     9    
@@ -27,30 +22,49 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 SoftwareSerial rs485(PIN_RS485_RX, PIN_RS485_TX);
 
-// =================================================================================
 // СТРУКТУРЫ ДАННЫХ
-// =================================================================================
 struct MasterData { 
-  bool doReset; bool isManualMode; bool isNetMode; bool saveSettings; 
+  bool doReset; bool isManualMode; bool isNetMode; bool saveSettings; bool resetSession;
   uint8_t timeoutDens; uint8_t timeoutStop; uint8_t timeoutNet; uint8_t timeoutTwine;
-  uint8_t soundMode; 
+  uint8_t timeoutMotor; uint8_t soundMode; 
 };
-MasterData txData = {false, false, false, false, 1, 4, 2, 3, 2}; 
+MasterData txData = {false, false, false, false, false, 1, 4, 2, 3, 10, 2}; 
 
 struct SlaveData {
   uint8_t currentState; uint16_t sessionBales; uint32_t totalBales;   
   uint8_t t_Dens; uint8_t t_Stop; uint8_t t_Net; uint8_t t_Twine;
-  uint8_t soundMode; 
+  uint8_t t_Motor; uint8_t soundMode; 
 };
-SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 2}; 
+SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 10, 2}; 
 
 bool isConnected = false;        
 unsigned long lastPollTime = 0;  
 byte noLinkChar[8] = { 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b11111, 0b00000 };
 
 // =================================================================================
-// КЛАССЫ
+// ПРОГРАММНЫЙ СТОРОЖЕВОЙ ПЕС (SWDT) НА ТАЙМЕРЕ 1
 // =================================================================================
+volatile uint8_t watchdogCounter = 0;
+void setupSWDT() {
+  noInterrupts();
+  TCCR1A = 0; TCCR1B = 0; TCNT1  = 0;
+  OCR1A = 15624; // Прерывание каждую 1 секунду (при 16MHz и делителе 1024)
+  TCCR1B |= (1 << WGM12); // CTC режим
+  TCCR1B |= (1 << CS12) | (1 << CS10); // Делитель 1024
+  TIMSK1 |= (1 << OCIE1A); // Включить прерывание
+  interrupts();
+}
+
+ISR(TIMER1_COMPA_vect) {
+  watchdogCounter++;
+  if (watchdogCounter >= 4) { // Если loop() висит 4 секунды
+    TIMSK1 = 0; // Отключаем таймер
+    cli();      // Очищаем флаг прерываний для чистого рестарта ядра
+    asm volatile ("jmp 0"); // Жесткий прыжок в начало программы (Soft Reset)
+  }
+}
+
+// КЛАССЫ
 class Button {
   private:
     uint8_t pin; unsigned long lastChange; bool state; bool lastReading; bool stateChanged;
@@ -72,28 +86,19 @@ class Button {
 
 class Beeper {
   private:
-    uint8_t pin; int beepsLeft = 0; unsigned long lastToggle = 0; bool isOn = false; uint32_t duration;
-    uint8_t patternType = 0; 
+    uint8_t pin; int beepsLeft = 0; unsigned long lastToggle = 0; bool isOn = false; uint32_t duration; uint8_t patternType = 0; 
   public:
     Beeper(uint8_t p) : pin(p) {}
-    void begin() { 
-      pinMode(pin, OUTPUT); 
-      digitalWrite(pin, HIGH); 
-    }
+    void begin() { pinMode(pin, OUTPUT); digitalWrite(pin, HIGH); }
     void play(int count, uint32_t dur = 300) { 
       if (slaveData.soundMode == 0) return; 
-      patternType = 0;
-      beepsLeft = count * 2; duration = dur; isOn = true; 
-      digitalWrite(pin, LOW);  
-      lastToggle = millis(); beepsLeft--; 
+      patternType = 0; beepsLeft = count * 2; duration = dur; isOn = true; 
+      digitalWrite(pin, LOW); lastToggle = millis(); beepsLeft--; 
     }
     void playShortLong() {
       if (slaveData.soundMode == 0) return;
-      patternType = 1;
-      beepsLeft = 4; 
-      isOn = true;
-      digitalWrite(pin, LOW); 
-      lastToggle = millis(); beepsLeft--;
+      patternType = 1; beepsLeft = 4; isOn = true;
+      digitalWrite(pin, LOW); lastToggle = millis(); beepsLeft--;
     }
     void update() {
       if (beepsLeft > 0) {
@@ -104,15 +109,9 @@ class Beeper {
           else if (beepsLeft == 1) currentDur = 800; 
         }
         if (millis() - lastToggle >= currentDur) {
-          isOn = !isOn; 
-          digitalWrite(pin, isOn ? LOW : HIGH); 
-          lastToggle = millis(); beepsLeft--;
+          isOn = !isOn; digitalWrite(pin, isOn ? LOW : HIGH); lastToggle = millis(); beepsLeft--;
         }
-      }
-      else if (beepsLeft == 0 && isOn) {
-        isOn = false;
-        digitalWrite(pin, HIGH); 
-      }
+      } else if (beepsLeft == 0 && isOn) { isOn = false; digitalWrite(pin, HIGH); }
     }
 };
 
@@ -131,32 +130,24 @@ uint8_t prevLoopState = 0;
 
 unsigned long comboTimer = 0; bool comboTriggered = false;
 uint8_t settingIndex = 0; 
-uint8_t edit_t_Dens, edit_t_Stop, edit_t_Net, edit_t_Twine, edit_soundMode; 
+uint8_t edit_t_Dens, edit_t_Stop, edit_t_Net, edit_t_Twine, edit_t_Motor, edit_soundMode; 
 bool pendingSave = false; 
 
-// =================================================================================
 void setup() {
   pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
   swMode.begin(); swNet.begin(); btnScreen.begin(); btnAction.begin();
   cabinBuzzer.begin(); 
   
-  lcd.init(); 
-  
-  // --- АНТИЗАВИСАНИЕ ДИСПЛЕЯ (I2C TIMEOUT) ---
-  // Если экран из-за наводки перестанет отвечать, Ардуино не зависнет, 
-  // а сбросит шину через 25 миллисекунд и продолжит работу кода!
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.setWireTimeout(25000, true);
   #endif
   
-  lcd.backlight(); lcd.createChar(0, noLinkChar); 
-  
+  lcd.init(); lcd.backlight(); lcd.createChar(0, noLinkChar); 
   lcd.setCursor(0, 0); lcd.print(F("BALER CONTROL")); 
   lcd.setCursor(0, 1); lcd.print(F("SYSTEM START..."));
   
-  digitalWrite(PIN_BUZZER, LOW); delay(100); digitalWrite(PIN_BUZZER, HIGH); 
-  delay(1000); 
-  lcd.clear();
+  delay(1000); lcd.clear();
+  setupSWDT(); // Запуск программного Сторожевого пса
 }
 
 void pollSlave() {
@@ -169,6 +160,7 @@ void pollSlave() {
   for (uint16_t i = 0; i < sizeof(MasterData); i++) { rs485.write(ptr[i]); crc ^= ptr[i]; }
   rs485.write(crc); rs485.flush(); digitalWrite(PIN_RS485_EN, LOW); 
   if (pendingSave) { txData.saveSettings = false; pendingSave = false; }
+  if (txData.resetSession) txData.resetSession = false; // Скидываем флаг
 
   unsigned long waitStart = millis(); bool replied = false;
   while (millis() - waitStart < 80) {
@@ -189,7 +181,8 @@ void pollSlave() {
 }
 
 void loop() {
-  // Очистка флага таймаута дисплея, если он сработал
+  watchdogCounter = 0; // СБРОС СТОРОЖЕВОГО ПСА (Мы живы!)
+  
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.clearWireTimeoutFlag();
   #endif
@@ -200,9 +193,7 @@ void loop() {
   if (millis() - lastPollTime >= 300) { pollSlave(); lastPollTime = millis(); }
 
   if (slaveData.currentState != prevLoopState && isConnected) {
-    uint8_t curr = slaveData.currentState;
-    uint8_t prev = prevLoopState;
-
+    uint8_t curr = slaveData.currentState; uint8_t prev = prevLoopState;
     if (curr == 1) { cabinBuzzer.play(3, 400); }
     else if (curr == 2 || (curr == 3 && prev < 2)) { cabinBuzzer.play(1, 250); }
     else if (curr == 5) { cabinBuzzer.playShortLong(); }
@@ -211,36 +202,28 @@ void loop() {
   }
 
   if (swMode.isPressed()) {
-    if (slaveData.currentState == 1 && prevLoopState == 0) {
-      stopwatchStartTime = millis(); isStopwatchRunning = true; showStoppedTime = false;
-    }
-    if (isStopwatchRunning && btnAction.justPressed()) {
-      stoppedTimeSec = (millis() - stopwatchStartTime) / 1000;
-      isStopwatchRunning = false; showStoppedTime = true; 
-    }
+    if (slaveData.currentState == 1 && prevLoopState == 0) { stopwatchStartTime = millis(); isStopwatchRunning = true; showStoppedTime = false; }
+    if (isStopwatchRunning && btnAction.justPressed()) { stoppedTimeSec = (millis() - stopwatchStartTime) / 1000; isStopwatchRunning = false; showStoppedTime = true; }
     if (slaveData.currentState == 0) { isStopwatchRunning = false; showStoppedTime = false; }
   } else { isStopwatchRunning = false; showStoppedTime = false; }
   
   prevLoopState = slaveData.currentState; 
 
+  // Вход в меню
   if (btnScreen.isPressed() && btnAction.isPressed() && isConnected) {
     if (swMode.isPressed()) {
-      if (millis() - comboTimer >= 500) { 
-        lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); comboTimer = millis();
-      }
+      if (millis() - comboTimer >= 500) { lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); comboTimer = millis(); }
     } else {
       if (millis() - comboTimer >= 2000 && !comboTriggered) {
         comboTriggered = true; 
         if (screenPage != 2) {
           screenPage = 2; settingIndex = 0;
-          edit_t_Dens = slaveData.t_Dens; edit_t_Stop = slaveData.t_Stop; 
-          edit_t_Net = slaveData.t_Net; edit_t_Twine = slaveData.t_Twine;
-          edit_soundMode = slaveData.soundMode; 
+          edit_t_Dens = slaveData.t_Dens; edit_t_Stop = slaveData.t_Stop; edit_t_Net = slaveData.t_Net; 
+          edit_t_Twine = slaveData.t_Twine; edit_t_Motor = slaveData.t_Motor; edit_soundMode = slaveData.soundMode; 
           lcd.clear(); lcd.setCursor(0,0); lcd.print(F("== NASTROYKI ==")); delay(1000); lcd.clear();
         } else {
-          txData.timeoutDens = edit_t_Dens; txData.timeoutStop = edit_t_Stop; 
-          txData.timeoutNet = edit_t_Net; txData.timeoutTwine = edit_t_Twine;
-          txData.soundMode = edit_soundMode; 
+          txData.timeoutDens = edit_t_Dens; txData.timeoutStop = edit_t_Stop; txData.timeoutNet = edit_t_Net; 
+          txData.timeoutTwine = edit_t_Twine; txData.timeoutMotor = edit_t_Motor; txData.soundMode = edit_soundMode; 
           pendingSave = true; screenPage = 0;
           lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SOHRANENO V PRES")); delay(1000); lcd.clear();
         }
@@ -248,34 +231,46 @@ void loop() {
     }
   } else { comboTimer = millis(); comboTriggered = false; }
 
+  // Навигация меню
   if (screenPage == 2) { 
-    if (btnScreen.justPressed() && !btnAction.isPressed()) { 
-      settingIndex++; 
-      if (settingIndex > 4) settingIndex = 0; 
-      lcd.clear(); 
-    }
-    
+    if (btnScreen.justPressed() && !btnAction.isPressed()) { settingIndex++; if (settingIndex > 5) settingIndex = 0; lcd.clear(); }
     if (btnAction.justPressed() && !btnScreen.isPressed()) {
       if (swMode.isPressed()) { lcd.setCursor(0, 1); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); } 
       else {
-        uint8_t *valPtr;
+        // Инициализируем указатель безопасным значением
+        uint8_t *valPtr = &edit_t_Dens; 
+        
         if (settingIndex == 0) valPtr = &edit_t_Dens; 
         else if (settingIndex == 1) valPtr = &edit_t_Stop;
         else if (settingIndex == 2) valPtr = &edit_t_Net; 
         else if (settingIndex == 3) valPtr = &edit_t_Twine;
         else if (settingIndex == 4) valPtr = &edit_soundMode; 
+        else if (settingIndex == 5) valPtr = &edit_t_Motor;
         
         if (settingIndex == 4) { 
           if (!swNet.isPressed()) { if (*valPtr < 2) (*valPtr)++; } else { if (*valPtr > 0) (*valPtr)--; }
+        } else if (settingIndex == 5) { // Лимиты защиты мотора (5 - 30 сек)
+          if (!swNet.isPressed()) { if (*valPtr < 30) (*valPtr)++; } else { if (*valPtr > 5) (*valPtr)--; }
         } else { 
           if (!swNet.isPressed()) { if (*valPtr < 20) (*valPtr)++; } else { if (*valPtr > 1) (*valPtr)--; }                     
         }
       }
     }
   } else {
+    // СБРОС СЕССИИ (Удержание левой кнопки ровно 5 секунд)
+    if (btnScreen.isHeldFor(5000) && !swMode.isPressed()) {
+      txData.resetSession = true;
+      lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SBROS SESSII...")); delay(1000); lcd.clear();
+      screenPage = 0; // Возвращаем на главный экран после сброса
+      screenTimer = millis(); // Обновляем таймер
+    }
+    
+    // Переключение экранов (простое нажатие)
     if (btnScreen.justPressed() && !btnAction.isPressed()) {
       screenPage = (screenPage == 0) ? 1 : 0; screenTimer = millis(); lcd.clear(); updateDisplay(); lastDisplayUpdate = millis();
     }
+    
+    // Глобальный сброс пресса (удержание правой кнопки)
     if (!swMode.isPressed()) {
       if (btnAction.isHeldFor(1000) && !resetCommandSent && !btnScreen.isPressed()) {
         txData.doReset = true; resetCommandSent = true; 
@@ -283,6 +278,7 @@ void loop() {
       }
       if (!btnAction.isPressed()) resetCommandSent = false;
     }
+    // Авто-возврат экрана
     if (screenPage == 1 && (millis() - screenTimer >= 5000)) { screenPage = 0; lcd.clear(); }
   }
 
@@ -321,24 +317,21 @@ void updateDisplay() {
   } else if (screenPage == 2) {
     lcd.setCursor(0, 0); lcd.print(F("SET: "));
     switch (settingIndex) {
-      case 0: lcd.print(F("PLOTNOST  ")); break; 
-      case 1: lcd.print(F("TRACTOR   ")); break;
-      case 2: lcd.print(F("SETKA     ")); break; 
-      case 3: lcd.print(F("SHPAGAT   ")); break;
-      case 4: lcd.print(F("ZVUK      ")); break; 
+      case 0: lcd.print(F("PLOTNOST  ")); break; case 1: lcd.print(F("TRACTOR   ")); break;
+      case 2: lcd.print(F("SETKA     ")); break; case 3: lcd.print(F("SHPAGAT   ")); break;
+      case 4: lcd.print(F("ZVUK      ")); break; case 5: lcd.print(F("ZASCHITA  ")); break;
     }
     lcd.setCursor(0, 1); 
-    
     if (settingIndex == 4) {
       lcd.print(F("REZH: "));
       if (edit_soundMode == 0) lcd.print(F("TOLKO PRES"));
       else if (edit_soundMode == 1) lcd.print(F("TOLKO PULT"));
       else if (edit_soundMode == 2) lcd.print(F("PRES+PULT "));
     } else {
-      lcd.print(F("VREMYA: "));
-      uint8_t val = 0;
+      lcd.print(F("VREMYA: ")); uint8_t val = 0;
       if (settingIndex == 0) val = edit_t_Dens; else if (settingIndex == 1) val = edit_t_Stop;
       else if (settingIndex == 2) val = edit_t_Net; else if (settingIndex == 3) val = edit_t_Twine;
+      else if (settingIndex == 5) val = edit_t_Motor;
       char buffer[10]; sprintf(buffer, "%2u sek  ", val); lcd.print(buffer);
     }
   }
