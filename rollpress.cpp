@@ -1,6 +1,6 @@
 /*
  * ПРОЕКТ: Система управления пресс-подборщиком (Блок Пресса / Slave)
- * ВЕРСИЯ: 2.1 (Оптимизация EEPROM (update), полная валидация, фикс кликов)
+ * ВЕРСИЯ: 2.2 (Отключаемая защита (0=выкл), увеличенный антидребезг 150мс)
  */
 
 #include <SoftwareSerial.h>
@@ -23,7 +23,7 @@
 
 SoftwareSerial rs485(PIN_RS485_RX, PIN_RS485_TX);
 
-// ВНЕШНИЙ EEPROM (I2C AT24Cxx)
+// ВНЕШНИЙ EEPROM
 #define EEPROM_ADDR 0x50       
 #define EEPROM_MAGIC_BYTE 0x45 
 #define ADDR_MAGIC        0    
@@ -42,11 +42,11 @@ uint8_t t_Dens = 1;
 uint8_t t_Stop = 4;
 uint8_t t_Net = 2;
 uint8_t t_Twine = 3;
-uint8_t t_Motor = 10; 
+uint8_t t_Motor = 40; // По умолчанию 40 сек
 uint8_t soundMode = 2; 
 
 struct Config {
-  const uint32_t debounce = 50;             
+  const uint32_t debounce = 150;  // УВЕЛИЧЕНО до 150 мс для защиты от тряски трактора          
   const bool motorActiveHigh = true;  
   const bool soundActiveHigh = true;  
   const bool lightActiveHigh = true;  
@@ -72,53 +72,36 @@ unsigned long lastMasterPacketTime = 0;
 bool isRemoteConnected = false;
 
 // =================================================================================
-// ФУНКЦИИ РАБОТЫ С EEPROM (С ЗАЩИТОЙ ОТ ИЗНОСА)
-// =================================================================================
 void writeEEPROM_Byte(uint16_t mem_addr, uint8_t data) {
   Wire.beginTransmission(EEPROM_ADDR);
-  Wire.write((int)(mem_addr >> 8));   
-  Wire.write((int)(mem_addr & 0xFF)); 
-  Wire.write(data);                   
+  Wire.write((int)(mem_addr >> 8)); Wire.write((int)(mem_addr & 0xFF)); Wire.write(data);                   
   Wire.endTransmission(); delay(5); 
 }
-
 uint8_t readEEPROM_Byte(uint16_t mem_addr) {
   uint8_t data = 0xFF; Wire.beginTransmission(EEPROM_ADDR);
   Wire.write((int)(mem_addr >> 8)); Wire.write((int)(mem_addr & 0xFF)); Wire.endTransmission();
   Wire.requestFrom(EEPROM_ADDR, 1); if (Wire.available()) data = Wire.read(); return data;
 }
-
-// НОВОЕ: Читаем перед записью. Экономит 5мс и бережет память!
 void updateEEPROM_Byte(uint16_t mem_addr, uint8_t data) {
   if (readEEPROM_Byte(mem_addr) == data) return; 
   writeEEPROM_Byte(mem_addr, data);
 }
-
 void writeEEPROM_Int(uint16_t mem_addr, uint16_t data) {
-  updateEEPROM_Byte(mem_addr, (data & 0xFF)); 
-  updateEEPROM_Byte(mem_addr + 1, ((data >> 8) & 0xFF));
+  updateEEPROM_Byte(mem_addr, (data & 0xFF)); updateEEPROM_Byte(mem_addr + 1, ((data >> 8) & 0xFF));
 }
-
 uint16_t readEEPROM_Int(uint16_t mem_addr) {
   uint16_t data = readEEPROM_Byte(mem_addr); data |= ((uint16_t)readEEPROM_Byte(mem_addr + 1) << 8); return data;
 }
-
 void writeEEPROM_Long(uint16_t mem_addr, uint32_t data) {
-  updateEEPROM_Byte(mem_addr, (data & 0xFF)); 
-  updateEEPROM_Byte(mem_addr + 1, ((data >> 8) & 0xFF));
-  updateEEPROM_Byte(mem_addr + 2, ((data >> 16) & 0xFF)); 
-  updateEEPROM_Byte(mem_addr + 3, ((data >> 24) & 0xFF));
+  updateEEPROM_Byte(mem_addr, (data & 0xFF)); updateEEPROM_Byte(mem_addr + 1, ((data >> 8) & 0xFF));
+  updateEEPROM_Byte(mem_addr + 2, ((data >> 16) & 0xFF)); updateEEPROM_Byte(mem_addr + 3, ((data >> 24) & 0xFF));
 }
-
 uint32_t readEEPROM_Long(uint16_t mem_addr) {
   uint32_t data = readEEPROM_Byte(mem_addr); data |= ((uint32_t)readEEPROM_Byte(mem_addr + 1) << 8);
-  data |= ((uint32_t)readEEPROM_Byte(mem_addr + 2) << 16); data |= ((uint32_t)readEEPROM_Byte(mem_addr + 3) << 24);
-  return data;
+  data |= ((uint32_t)readEEPROM_Byte(mem_addr + 2) << 16); data |= ((uint32_t)readEEPROM_Byte(mem_addr + 3) << 24); return data;
 }
+// =================================================================================
 
-// =================================================================================
-// КЛАССЫ ПЕРИФЕРИИ
-// =================================================================================
 class Sensor {
   private:
     uint8_t pin; bool invertLogic; unsigned long lastChange; unsigned long stateChangeTime;
@@ -176,14 +159,9 @@ class LightController {
     }
 };
 
-Sensor densSensor(PIN_DENSITY, true); 
-Sensor startSensor(PIN_S_START, true);
-Sensor endSensor(PIN_S_END, true);
-Sensor doorSensor(PIN_DOOR, false); 
-Sensor resetBtn(PIN_RESET, true); 
-
-Signaler horn(PIN_RELAY_SOUND);
-LightController beacon(PIN_RELAY_LIGHT);
+Sensor densSensor(PIN_DENSITY, true); Sensor startSensor(PIN_S_START, true);
+Sensor endSensor(PIN_S_END, true); Sensor doorSensor(PIN_DOOR, false); Sensor resetBtn(PIN_RESET, true); 
+Signaler horn(PIN_RELAY_SOUND); LightController beacon(PIN_RELAY_LIGHT);
 
 enum BalerState { WAIT_DENSITY, WAIT_TRACTOR, WAIT_START_SENSOR, MOTOR_RUNNING_TIMER, WAIT_END_SENSOR, WAIT_DOOR, ERROR_STATE, TEST_MODE, RETURN_TO_HOME };
 BalerState currentState = WAIT_DENSITY; 
@@ -200,15 +178,12 @@ void motorOn() {
   if (getNetMode()) digitalWrite(PIN_RELAY_NET, cfg.motorActiveHigh ? HIGH : LOW);
   else digitalWrite(PIN_RELAY_TWINE, cfg.motorActiveHigh ? HIGH : LOW);
 }
-void motorOff() { 
-  digitalWrite(PIN_RELAY_TWINE, cfg.motorActiveHigh ? LOW : HIGH);
-  digitalWrite(PIN_RELAY_NET, cfg.motorActiveHigh ? LOW : HIGH);
-}
+void motorOff() { digitalWrite(PIN_RELAY_TWINE, cfg.motorActiveHigh ? LOW : HIGH); digitalWrite(PIN_RELAY_NET, cfg.motorActiveHigh ? LOW : HIGH); }
+
 void executeEmergencyReset() {
   if (currentState != WAIT_DENSITY && currentState != TEST_MODE) {  
     motorOff(); horn.play(1, 600); beacon.setMode(0); doorWasOpened = doorSensor.isPressed(); 
-    resetClicks = 0; // ИСПРАВЛЕНИЕ: Сбрасываем счетчик кликов при аварии
-    currentState = WAIT_DENSITY;           
+    resetClicks = 0; currentState = WAIT_DENSITY;           
   }
 }
 
@@ -233,16 +208,10 @@ void listenRS485() {
         for (uint16_t i = 0; i < sizeof(MasterData); i++) { ptr[i] = rs485.read(); crc ^= ptr[i]; }
         if (crc == rs485.read()) {
           lastMasterPacketTime = millis(); isRemoteConnected = true; 
-
-          if (rxData.resetSession) {
-             sessionBales = 0; writeEEPROM_Int(ADDR_SESSION_BALES, sessionBales);
-          }
-
+          if (rxData.resetSession) { sessionBales = 0; writeEEPROM_Int(ADDR_SESSION_BALES, sessionBales); }
           if (rxData.saveSettings) {
             t_Dens = rxData.timeoutDens; t_Stop = rxData.timeoutStop; t_Net = rxData.timeoutNet;
             t_Twine = rxData.timeoutTwine; t_Motor = rxData.timeoutMotor; soundMode = rxData.soundMode; 
-            
-            // Запись через умную функцию update (экономия памяти и времени)
             updateEEPROM_Byte(ADDR_T_DENS, t_Dens); updateEEPROM_Byte(ADDR_T_STOP, t_Stop);
             updateEEPROM_Byte(ADDR_T_NET, t_Net); updateEEPROM_Byte(ADDR_T_TWINE, t_Twine);
             updateEEPROM_Byte(ADDR_T_MOTOR, t_Motor); updateEEPROM_Byte(ADDR_SOUND_MODE, soundMode); 
@@ -260,23 +229,20 @@ void setup() {
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.setWireTimeout(25000, true);
   #endif
-
   uint8_t magic = readEEPROM_Byte(ADDR_MAGIC);
   if (magic == EEPROM_MAGIC_BYTE) {
-    totalBales = readEEPROM_Long(ADDR_TOTAL_BALES);
-    sessionBales = readEEPROM_Int(ADDR_SESSION_BALES);
+    totalBales = readEEPROM_Long(ADDR_TOTAL_BALES); sessionBales = readEEPROM_Int(ADDR_SESSION_BALES);
     t_Dens = readEEPROM_Byte(ADDR_T_DENS); t_Stop = readEEPROM_Byte(ADDR_T_STOP);
     t_Net = readEEPROM_Byte(ADDR_T_NET); t_Twine = readEEPROM_Byte(ADDR_T_TWINE);
     t_Motor = readEEPROM_Byte(ADDR_T_MOTOR); soundMode = readEEPROM_Byte(ADDR_SOUND_MODE);
     
-    // ИСПРАВЛЕНИЕ: Тотальная валидация параметров после чтения из памяти
     if (soundMode > 2) soundMode = 2; 
-    if (t_Motor < 5 || t_Motor > 30) t_Motor = 10;
+    // Если переменная не 0 (не Отключена) и вне рамок 10-90, сбрасываем на 40
+    if (t_Motor != 0 && (t_Motor < 10 || t_Motor > 90)) t_Motor = 40;
     if (t_Dens < 1 || t_Dens > 20) t_Dens = 1;
     if (t_Stop < 1 || t_Stop > 20) t_Stop = 4;
     if (t_Net  < 1 || t_Net  > 20) t_Net  = 2;
     if (t_Twine< 1 || t_Twine > 20) t_Twine= 3;
-    
   } else {
     writeEEPROM_Long(ADDR_TOTAL_BALES, totalBales); writeEEPROM_Int(ADDR_SESSION_BALES, sessionBales);
     writeEEPROM_Byte(ADDR_T_DENS, t_Dens); writeEEPROM_Byte(ADDR_T_STOP, t_Stop);
@@ -284,11 +250,9 @@ void setup() {
     writeEEPROM_Byte(ADDR_T_MOTOR, t_Motor); writeEEPROM_Byte(ADDR_SOUND_MODE, soundMode);
     writeEEPROM_Byte(ADDR_MAGIC, EEPROM_MAGIC_BYTE);
   }
-
   pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
   densSensor.begin(); startSensor.begin(); endSensor.begin(); doorSensor.begin(); resetBtn.begin();
-  pinMode(PIN_SWITCH_NET, INPUT_PULLUP); 
-  horn.begin(); beacon.begin();
+  pinMode(PIN_SWITCH_NET, INPUT_PULLUP); horn.begin(); beacon.begin();
   pinMode(PIN_RELAY_TWINE, OUTPUT); pinMode(PIN_RELAY_NET, OUTPUT);
   motorOff(); beacon.setMode(0); 
 }
@@ -299,17 +263,14 @@ void loop() {
   #endif
 
   densSensor.update(); startSensor.update(); endSensor.update(); doorSensor.update(); resetBtn.update();
-  horn.update(); beacon.update(); 
-  listenRS485();
+  horn.update(); beacon.update(); listenRS485();
 
   if (isRemoteConnected && (millis() - lastMasterPacketTime > 2000)) { isRemoteConnected = false; }
-
   bool isResetJustPressed = resetBtn.justPressed();
 
   if (resetBtn.isHeldFor(10000) && currentState != TEST_MODE) {
     motorOff(); horn.play(1, 100); beacon.setMode(3); currentState = TEST_MODE; testModeStartTime = millis(); resetClicks = 0; 
   }
-
   if (isResetJustPressed && currentState != TEST_MODE) {
     if (millis() - lastResetClickTime <= 600) resetClicks++; else resetClicks = 1; 
     lastResetClickTime = millis();
@@ -335,25 +296,22 @@ void loop() {
       break;
     case WAIT_START_SENSOR:
       if (startSensor.isPressed()) { horn.play(1, 200); stateTimer = millis(); currentState = MOTOR_RUNNING_TIMER; } 
-      else if (millis() - stateTimer >= (t_Motor * 1000UL)) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } 
+      // Если t_Motor == 0, защита не сработает никогда
+      else if (t_Motor > 0 && millis() - stateTimer >= (t_Motor * 1000UL)) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } 
       break;
     case MOTOR_RUNNING_TIMER:
       if (millis() - stateTimer >= (getNetMode() ? (t_Net * 1000UL) : (t_Twine * 1000UL))) { motorOff(); stateTimer = millis(); currentState = WAIT_END_SENSOR; } 
       break;
     case WAIT_END_SENSOR:
       if (endSensor.isPressed()) { horn.play(2, 400); doorWasOpened = false; currentState = WAIT_DOOR; }
-      else if (millis() - stateTimer >= (t_Motor * 1000UL)) { beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } 
+      // Защита обрезки. Отключена если 0
+      else if (t_Motor > 0 && millis() - stateTimer >= (t_Motor * 1000UL)) { beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } 
       break;
     case WAIT_DOOR:
       if (doorSensor.isPressed() && !doorWasOpened) doorWasOpened = true;
       else if (!doorSensor.isPressed() && doorWasOpened) { 
-        horn.play(2, 150); 
-        totalBales++; sessionBales++; 
-        
-        // Используем writeEEPROM_Long/Int, которые внутри теперь работают через update!
-        // Экономит ~25-30мс на каждый тюк
+        horn.play(2, 150); totalBales++; sessionBales++; 
         writeEEPROM_Long(ADDR_TOTAL_BALES, totalBales); writeEEPROM_Int(ADDR_SESSION_BALES, sessionBales);
-        
         doorWasOpened = false; beacon.setMode(0); currentState = WAIT_DENSITY; 
       } 
       break;
@@ -362,9 +320,8 @@ void loop() {
       break;
     case RETURN_TO_HOME:
       if (endSensor.isPressed()) { motorOff(); horn.play(2, 400); beacon.setMode(0); currentState = WAIT_DENSITY; }
-      else if (millis() - stateTimer >= (t_Motor * 1000UL)) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } break;
+      else if (t_Motor > 0 && millis() - stateTimer >= (t_Motor * 1000UL)) { motorOff(); beacon.setMode(2); stateTimer = millis(); currentState = ERROR_STATE; } break;
     case TEST_MODE:
-      // Выход только по таймеру (60с) для надежности проверок концевиков
       if (millis() - testModeStartTime >= 60000) { horn.play(2, 400); beacon.setMode(0); doorWasOpened = doorSensor.isPressed(); currentState = WAIT_DENSITY; } 
       else { if (!horn.isBusy()) { digitalWrite(PIN_RELAY_SOUND, (densSensor.isPressed() || startSensor.isPressed() || endSensor.isPressed() || doorSensor.isPressed() || resetBtn.isPressed()) ? (cfg.soundActiveHigh ? HIGH : LOW) : (cfg.soundActiveHigh ? LOW : HIGH)); } } break;
   }
