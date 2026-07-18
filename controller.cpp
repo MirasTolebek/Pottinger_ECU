@@ -1,6 +1,6 @@
 /*
  * ПРОЕКТ: Система управления пресс-подборщиком (Блок Пульта / Master)
- * ВЕРСИЯ: 2.2 (Исправлен UB с указателем, безопасный Soft Reset с cli())
+ * ВЕРСИЯ: 2.3 (Лимит защиты 90 сек, возможность полного ОТКЛЮЧЕНИЯ защиты)
  */
 
 #include <Wire.h>
@@ -28,14 +28,14 @@ struct MasterData {
   uint8_t timeoutDens; uint8_t timeoutStop; uint8_t timeoutNet; uint8_t timeoutTwine;
   uint8_t timeoutMotor; uint8_t soundMode; 
 };
-MasterData txData = {false, false, false, false, false, 1, 4, 2, 3, 10, 2}; 
+MasterData txData = {false, false, false, false, false, 1, 4, 2, 3, 40, 2}; // По умолчанию защита 40 сек
 
 struct SlaveData {
   uint8_t currentState; uint16_t sessionBales; uint32_t totalBales;   
   uint8_t t_Dens; uint8_t t_Stop; uint8_t t_Net; uint8_t t_Twine;
   uint8_t t_Motor; uint8_t soundMode; 
 };
-SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 10, 2}; 
+SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 40, 2}; 
 
 bool isConnected = false;        
 unsigned long lastPollTime = 0;  
@@ -48,19 +48,19 @@ volatile uint8_t watchdogCounter = 0;
 void setupSWDT() {
   noInterrupts();
   TCCR1A = 0; TCCR1B = 0; TCNT1  = 0;
-  OCR1A = 15624; // Прерывание каждую 1 секунду (при 16MHz и делителе 1024)
-  TCCR1B |= (1 << WGM12); // CTC режим
-  TCCR1B |= (1 << CS12) | (1 << CS10); // Делитель 1024
-  TIMSK1 |= (1 << OCIE1A); // Включить прерывание
+  OCR1A = 15624; // Прерывание каждую 1 секунду
+  TCCR1B |= (1 << WGM12); 
+  TCCR1B |= (1 << CS12) | (1 << CS10); 
+  TIMSK1 |= (1 << OCIE1A); 
   interrupts();
 }
 
 ISR(TIMER1_COMPA_vect) {
   watchdogCounter++;
-  if (watchdogCounter >= 4) { // Если loop() висит 4 секунды
-    TIMSK1 = 0; // Отключаем таймер
-    cli();      // Очищаем флаг прерываний для чистого рестарта ядра
-    asm volatile ("jmp 0"); // Жесткий прыжок в начало программы (Soft Reset)
+  if (watchdogCounter >= 4) { 
+    TIMSK1 = 0; 
+    cli();      
+    asm volatile ("jmp 0"); 
   }
 }
 
@@ -147,7 +147,7 @@ void setup() {
   lcd.setCursor(0, 1); lcd.print(F("SYSTEM START..."));
   
   delay(1000); lcd.clear();
-  setupSWDT(); // Запуск программного Сторожевого пса
+  setupSWDT(); 
 }
 
 void pollSlave() {
@@ -160,7 +160,7 @@ void pollSlave() {
   for (uint16_t i = 0; i < sizeof(MasterData); i++) { rs485.write(ptr[i]); crc ^= ptr[i]; }
   rs485.write(crc); rs485.flush(); digitalWrite(PIN_RS485_EN, LOW); 
   if (pendingSave) { txData.saveSettings = false; pendingSave = false; }
-  if (txData.resetSession) txData.resetSession = false; // Скидываем флаг
+  if (txData.resetSession) txData.resetSession = false;
 
   unsigned long waitStart = millis(); bool replied = false;
   while (millis() - waitStart < 80) {
@@ -181,7 +181,7 @@ void pollSlave() {
 }
 
 void loop() {
-  watchdogCounter = 0; // СБРОС СТОРОЖЕВОГО ПСА (Мы живы!)
+  watchdogCounter = 0; 
   
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.clearWireTimeoutFlag();
@@ -209,7 +209,6 @@ void loop() {
   
   prevLoopState = slaveData.currentState; 
 
-  // Вход в меню
   if (btnScreen.isPressed() && btnAction.isPressed() && isConnected) {
     if (swMode.isPressed()) {
       if (millis() - comboTimer >= 500) { lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); comboTimer = millis(); }
@@ -231,13 +230,11 @@ void loop() {
     }
   } else { comboTimer = millis(); comboTriggered = false; }
 
-  // Навигация меню
   if (screenPage == 2) { 
     if (btnScreen.justPressed() && !btnAction.isPressed()) { settingIndex++; if (settingIndex > 5) settingIndex = 0; lcd.clear(); }
     if (btnAction.justPressed() && !btnScreen.isPressed()) {
       if (swMode.isPressed()) { lcd.setCursor(0, 1); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); } 
       else {
-        // Инициализируем указатель безопасным значением
         uint8_t *valPtr = &edit_t_Dens; 
         
         if (settingIndex == 0) valPtr = &edit_t_Dens; 
@@ -249,28 +246,28 @@ void loop() {
         
         if (settingIndex == 4) { 
           if (!swNet.isPressed()) { if (*valPtr < 2) (*valPtr)++; } else { if (*valPtr > 0) (*valPtr)--; }
-        } else if (settingIndex == 5) { // Лимиты защиты мотора (5 - 30 сек)
-          if (!swNet.isPressed()) { if (*valPtr < 30) (*valPtr)++; } else { if (*valPtr > 5) (*valPtr)--; }
+        } else if (settingIndex == 5) { // Лимиты защиты (0 = Выкл, 10 - 90 сек)
+          if (!swNet.isPressed()) { 
+             if (*valPtr == 0) *valPtr = 10;
+             else if (*valPtr < 90) (*valPtr)++; 
+          } else { 
+             if (*valPtr > 10) (*valPtr)--; 
+             else if (*valPtr == 10) *valPtr = 0; // Переход на 0 (Отключение)
+          }
         } else { 
           if (!swNet.isPressed()) { if (*valPtr < 20) (*valPtr)++; } else { if (*valPtr > 1) (*valPtr)--; }                     
         }
       }
     }
   } else {
-    // СБРОС СЕССИИ (Удержание левой кнопки ровно 5 секунд)
     if (btnScreen.isHeldFor(5000) && !swMode.isPressed()) {
       txData.resetSession = true;
       lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SBROS SESSII...")); delay(1000); lcd.clear();
-      screenPage = 0; // Возвращаем на главный экран после сброса
-      screenTimer = millis(); // Обновляем таймер
+      screenPage = 0; screenTimer = millis(); 
     }
-    
-    // Переключение экранов (простое нажатие)
     if (btnScreen.justPressed() && !btnAction.isPressed()) {
       screenPage = (screenPage == 0) ? 1 : 0; screenTimer = millis(); lcd.clear(); updateDisplay(); lastDisplayUpdate = millis();
     }
-    
-    // Глобальный сброс пресса (удержание правой кнопки)
     if (!swMode.isPressed()) {
       if (btnAction.isHeldFor(1000) && !resetCommandSent && !btnScreen.isPressed()) {
         txData.doReset = true; resetCommandSent = true; 
@@ -278,7 +275,6 @@ void loop() {
       }
       if (!btnAction.isPressed()) resetCommandSent = false;
     }
-    // Авто-возврат экрана
     if (screenPage == 1 && (millis() - screenTimer >= 5000)) { screenPage = 0; lcd.clear(); }
   }
 
@@ -332,7 +328,13 @@ void updateDisplay() {
       if (settingIndex == 0) val = edit_t_Dens; else if (settingIndex == 1) val = edit_t_Stop;
       else if (settingIndex == 2) val = edit_t_Net; else if (settingIndex == 3) val = edit_t_Twine;
       else if (settingIndex == 5) val = edit_t_Motor;
-      char buffer[10]; sprintf(buffer, "%2u sek  ", val); lcd.print(buffer);
+      
+      // Отображение состояния ВЫКЛ, если значение защиты 0
+      if (settingIndex == 5 && val == 0) {
+        lcd.print(F("VYKL   "));
+      } else {
+        char buffer[10]; sprintf(buffer, "%2u sek  ", val); lcd.print(buffer);
+      }
     }
   }
 }
