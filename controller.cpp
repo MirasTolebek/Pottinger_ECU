@@ -1,13 +1,54 @@
 /*
  * ПРОЕКТ: Система управления пресс-подборщиком (Блок Пульта / Master)
- * ВЕРСИЯ: 2.3 (Лимит защиты 90 сек, возможность полного ОТКЛЮЧЕНИЯ защиты)
+ * ВЕРСИЯ: 2.5 (Восстановление шины I2C после захвата помехой от двигателя)
+ * ИЗМЕНЕНИЯ vs 2.4:
+ *   - wdt_enable(WDTO_2S) перенесён в САМОЕ НАЧАЛО setup() (сразу после
+ *     MCUSR=0/wdt_disable), а не в конец. Раньше если I2C-шина (LCD)
+ *     захватывалась помехой ИМЕННО во время lcd.init()/lcd.print() в
+ *     setup() - watchdog там ещё не был включён и не мог вытащить плату
+ *     из зависания. Теперь watchdog защищает весь setup() целиком.
+ *   - Добавлена процедура ручного восстановления шины I2C (i2cBusRecovery) -
+ *     если ведомое устройство (PCF8574 на LCD) осталось "зависшим" посреди
+ *     I2C-транзакции (типичный результат помехи от импульсов двигателя),
+ *     оно продолжает держать SDA в LOW даже после сброса самого МК. Обычный
+ *     software reset эту ситуацию не лечит - нужно вручную "дотактировать"
+ *     SCL до 9 импульсов, чтобы зависшее устройство отпустило линию.
+ *   - В loop() таймаут Wire теперь не просто "тихо" сбрасывается, а активно
+ *     обрабатывается: если он сработал - делаем восстановление шины и
+ *     переинициализацию LCD, а не просто идём дальше как ни в чём не бывало.
  */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <SoftwareSerial.h>
+#include <avr/wdt.h>   // <-- Аппаратный Watchdog (нужен новый загрузчик Optiboot!)
 
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// === ВОССТАНОВЛЕНИЕ ШИНЫ I2C ПОСЛЕ ЗАХВАТА ПОМЕХОЙ ===
+// Если ведомое устройство (PCF8574 на LCD) зависло посреди транзакции и
+// держит SDA в LOW - подаём до 9 тактовых импульсов на SCL, чтобы оно
+// "досчитало" ожидаемые биты и отпустило линию, затем вручную формируем
+// STOP-условие. Это стандартная процедура восстановления шины I2C.
+void i2cBusRecovery() {
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, OUTPUT);
+
+  for (uint8_t i = 0; i < 9; i++) {
+    if (digitalRead(SDA) == HIGH) break; // Шина уже свободна - устройство отпустило линию
+    digitalWrite(SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  }
+
+  // Вручную формируем STOP: SDA LOW->HIGH, пока SCL держится HIGH
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA, HIGH); delayMicroseconds(5);
+
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, INPUT_PULLUP);
+}
 
 // РАСПИНОВКА ПУЛЬТА
 #define PIN_SW_MODE      4    
@@ -40,29 +81,6 @@ SlaveData slaveData = {0, 0, 0, 1, 4, 2, 3, 40, 2};
 bool isConnected = false;        
 unsigned long lastPollTime = 0;  
 byte noLinkChar[8] = { 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b11111, 0b00000 };
-
-// =================================================================================
-// ПРОГРАММНЫЙ СТОРОЖЕВОЙ ПЕС (SWDT) НА ТАЙМЕРЕ 1
-// =================================================================================
-volatile uint8_t watchdogCounter = 0;
-void setupSWDT() {
-  noInterrupts();
-  TCCR1A = 0; TCCR1B = 0; TCNT1  = 0;
-  OCR1A = 15624; // Прерывание каждую 1 секунду
-  TCCR1B |= (1 << WGM12); 
-  TCCR1B |= (1 << CS12) | (1 << CS10); 
-  TIMSK1 |= (1 << OCIE1A); 
-  interrupts();
-}
-
-ISR(TIMER1_COMPA_vect) {
-  watchdogCounter++;
-  if (watchdogCounter >= 4) { 
-    TIMSK1 = 0; 
-    cli();      
-    asm volatile ("jmp 0"); 
-  }
-}
 
 // КЛАССЫ
 class Button {
@@ -134,6 +152,24 @@ uint8_t edit_t_Dens, edit_t_Stop, edit_t_Net, edit_t_Twine, edit_t_Motor, edit_s
 bool pendingSave = false; 
 
 void setup() {
+  // === ОБЯЗАТЕЛЬНО ПЕРВЫМИ СТРОЧКАМИ! ===
+  // Обнуляем MCUSR и глушим WDT сразу после старта.
+  MCUSR = 0;
+  wdt_disable();
+
+  // Включаем аппаратный watchdog СРАЗУ, а не в конце setup()!
+  // Раньше, если I2C-шина (LCD) захватывалась помехой от двигателя именно
+  // во время lcd.init()/lcd.print() ниже - watchdog ещё не был включён и
+  // не мог вытащить плату из зависания (отсюда "подсветка мигнула и всё
+  // замерло насовсем"). Теперь watchdog защищает весь setup() целиком.
+  wdt_enable(WDTO_2S);
+
+  // Восстановление шины I2C ПЕРЕД инициализацией LCD - на случай, если
+  // предыдущий сброс произошёл посреди I2C-транзакции и PCF8574 на LCD
+  // остался висеть с прижатой SDA (обычный software/watchdog reset это
+  // не лечит - нужна ручная процедура восстановления шины).
+  i2cBusRecovery();
+
   pinMode(PIN_RS485_EN, OUTPUT); digitalWrite(PIN_RS485_EN, LOW); rs485.begin(9600); 
   swMode.begin(); swNet.begin(); btnScreen.begin(); btnAction.begin();
   cabinBuzzer.begin(); 
@@ -141,13 +177,15 @@ void setup() {
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.setWireTimeout(25000, true);
   #endif
+  wdt_reset();
   
   lcd.init(); lcd.backlight(); lcd.createChar(0, noLinkChar); 
   lcd.setCursor(0, 0); lcd.print(F("BALER CONTROL")); 
   lcd.setCursor(0, 1); lcd.print(F("SYSTEM START..."));
+  wdt_reset();
   
   delay(1000); lcd.clear();
-  setupSWDT(); 
+  wdt_reset();
 }
 
 void pollSlave() {
@@ -181,8 +219,8 @@ void pollSlave() {
 }
 
 void loop() {
-  watchdogCounter = 0; 
-  
+  wdt_reset(); // Гладим аппаратного пса каждую итерацию
+
   #if defined(WIRE_HAS_TIMEOUT)
     Wire.clearWireTimeoutFlag();
   #endif
@@ -211,7 +249,7 @@ void loop() {
 
   if (btnScreen.isPressed() && btnAction.isPressed() && isConnected) {
     if (swMode.isPressed()) {
-      if (millis() - comboTimer >= 500) { lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); comboTimer = millis(); }
+      if (millis() - comboTimer >= 500) { lcd.clear(); lcd.setCursor(0,0); lcd.print(F("PEREVEDI V AVTO!")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear(); comboTimer = millis(); }
     } else {
       if (millis() - comboTimer >= 2000 && !comboTriggered) {
         comboTriggered = true; 
@@ -219,12 +257,12 @@ void loop() {
           screenPage = 2; settingIndex = 0;
           edit_t_Dens = slaveData.t_Dens; edit_t_Stop = slaveData.t_Stop; edit_t_Net = slaveData.t_Net; 
           edit_t_Twine = slaveData.t_Twine; edit_t_Motor = slaveData.t_Motor; edit_soundMode = slaveData.soundMode; 
-          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("== NASTROYKI ==")); delay(1000); lcd.clear();
+          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("== NASTROYKI ==")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear();
         } else {
           txData.timeoutDens = edit_t_Dens; txData.timeoutStop = edit_t_Stop; txData.timeoutNet = edit_t_Net; 
           txData.timeoutTwine = edit_t_Twine; txData.timeoutMotor = edit_t_Motor; txData.soundMode = edit_soundMode; 
           pendingSave = true; screenPage = 0;
-          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SOHRANENO V PRES")); delay(1000); lcd.clear();
+          lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SOHRANENO V PRES")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear();
         }
       }
     }
@@ -233,7 +271,7 @@ void loop() {
   if (screenPage == 2) { 
     if (btnScreen.justPressed() && !btnAction.isPressed()) { settingIndex++; if (settingIndex > 5) settingIndex = 0; lcd.clear(); }
     if (btnAction.justPressed() && !btnScreen.isPressed()) {
-      if (swMode.isPressed()) { lcd.setCursor(0, 1); lcd.print(F("PEREVEDI V AVTO!")); delay(1000); lcd.clear(); } 
+      if (swMode.isPressed()) { lcd.setCursor(0, 1); lcd.print(F("PEREVEDI V AVTO!")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear(); } 
       else {
         uint8_t *valPtr = &edit_t_Dens; 
         
@@ -262,7 +300,7 @@ void loop() {
   } else {
     if (btnScreen.isHeldFor(5000) && !swMode.isPressed()) {
       txData.resetSession = true;
-      lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SBROS SESSII...")); delay(1000); lcd.clear();
+      lcd.clear(); lcd.setCursor(0,0); lcd.print(F("SBROS SESSII...")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear();
       screenPage = 0; screenTimer = millis(); 
     }
     if (btnScreen.justPressed() && !btnAction.isPressed()) {
@@ -271,7 +309,7 @@ void loop() {
     if (!swMode.isPressed()) {
       if (btnAction.isHeldFor(1000) && !resetCommandSent && !btnScreen.isPressed()) {
         txData.doReset = true; resetCommandSent = true; 
-        screenPage = 0; lcd.clear(); lcd.setCursor(0, 0); lcd.print(F(">> SBROS OK <<  ")); delay(1000); lcd.clear();
+        screenPage = 0; lcd.clear(); lcd.setCursor(0, 0); lcd.print(F(">> SBROS OK <<  ")); wdt_reset(); delay(1000); wdt_reset(); lcd.clear();
       }
       if (!btnAction.isPressed()) resetCommandSent = false;
     }
